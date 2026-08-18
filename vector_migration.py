@@ -61,20 +61,35 @@ es = Elasticsearch(
 
 
 def _embed_one(text, max_retries=3):
-    """Single Ollama embedding call with retry on transient 400/5xx errors."""
+    """Single Ollama embedding call with retry on transient 5xx errors.
+    
+    Logs full response body on 400 errors for diagnosis.
+    """
     url = OLLAMA_BASE_URL + "/api/embeddings"
     payload = {"model": EMBED_MODEL, "prompt": text}
+    last_response = None
     for attempt in range(max_retries):
         response = requests.post(url, json=payload, timeout=120)
         if response.status_code == 200:
             return response.json()["embedding"]
-        if response.status_code in (400, 500, 502, 503, 504) and attempt < max_retries - 1:
-            wait = 2 ** attempt  # 1s, 2s, 4s
+        last_response = response
+        # Log the full error body on first 400 so we can diagnose
+        if response.status_code == 400 and attempt == 0:
+            print(f"    [400 BODY] {response.text[:500]}")
+            print(f"    [400 PAYLOAD] model={payload['model']} prompt_len={len(payload['prompt'])} prompt_preview={repr(payload['prompt'][:80])}")
+        if response.status_code in (500, 502, 503, 504) and attempt < max_retries - 1:
+            wait = 2 ** attempt
             print(f"    Retry {attempt+1}/{max_retries} (status {response.status_code}), waiting {wait}s...")
             time.sleep(wait)
             continue
-    response.raise_for_status()
-    return response.json()["embedding"]
+        # On 400, also retry once after a longer pause (Ollama may need model reload)
+        if response.status_code == 400 and attempt < max_retries - 1:
+            wait = 3
+            print(f"    Retry {attempt+1}/{max_retries} (status 400), waiting {wait}s...")
+            time.sleep(wait)
+            continue
+    last_response.raise_for_status()
+    return last_response.json()["embedding"]
 
 
 def get_embedding(text):
