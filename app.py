@@ -2,7 +2,7 @@ import os
 import requests
 from flask import Flask, request, jsonify, render_template_string, session
 from elasticsearch import Elasticsearch
-from sentence_transformers import SentenceTransformer
+from field_mapping import TYPE_MAPPING
 
 
 def load_env_file(path=".env"):
@@ -41,7 +41,7 @@ LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or os.getenv("OLLAMA_URL") or "http://
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL") or os.getenv("OLLAMA_MODEL") or "llama3"
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "30"))
-EMBED_MODEL = os.getenv("EMBED_MODEL") or "all-MiniLM-L6-v2"
+EMBED_MODEL = os.getenv("EMBED_MODEL") or "nomic-embed-text"
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
 APP_PORT = int(os.getenv("APP_PORT", "5000"))
 
@@ -51,20 +51,56 @@ try:
         ES_URL,
         basic_auth=(ES_USER, ES_PASS) if ES_USER else None,
         verify_certs=ES_VERIFY_CERTS,
+        request_timeout=120,
     )
     if not es.ping():
         print("Warning: Could not connect to Elasticsearch.")
 except Exception as e:
     print(f"Elasticsearch Initialization Error: {e}")
 
-# Initialize Vector Model (Must match the ingestion dimension size)
-print("Loading Embedding Model...")
-embedding_model = SentenceTransformer(EMBED_MODEL)
+def _embed_one(text):
+    """Single Ollama embedding call."""
+    url = LLM_BASE_URL + "/api/embeddings"
+    payload = {"model": EMBED_MODEL, "prompt": text}
+    response = requests.post(url, json=payload, timeout=120)
+    if response.status_code == 200:
+        return response.json()["embedding"]
+    raise RuntimeError(f"Ollama embedding error {response.status_code}: {response.text}")
 
 
-def get_embedding(text):
-    """Convert text into a 384-dimensional dense vector."""
-    return embedding_model.encode(text).tolist()
+def get_embedding(text, chunk_size=7500):
+    """Generate embedding via Ollama's /api/embeddings endpoint.
+    
+    User queries can be long, so we chunk and average to preserve quality.
+    """
+    try:
+        if len(text) <= chunk_size:
+            return _embed_one(text)
+
+        overlap = 500
+        chunks = []
+        start = 0
+        while start < len(text):
+            chunks.append(text[start:start + chunk_size])
+            start += chunk_size - overlap
+
+        import numpy as np
+        vectors = [_embed_one(chunk) for chunk in chunks]
+        return np.mean(vectors, axis=0).tolist()
+    except Exception as e:
+        print(f"Ollama embedding exception: {e}")
+    return [0.0] * 768
+
+
+# Build list of all per-field vector column names from field_mapping
+VECTOR_FIELD_NAMES = []
+_seen = set()
+for _mapping in TYPE_MAPPING.values():
+    for _field in _mapping["fields"]:
+        vec_name = "vec_" + _field
+        if vec_name not in _seen:
+            _seen.add(vec_name)
+            VECTOR_FIELD_NAMES.append(vec_name)
 
 
 def query_ollama(prompt):
@@ -155,23 +191,22 @@ def chat():
     # 2. Vectorize user message for ES retrieval
     query_vector = get_embedding(user_message)
 
-    # 3. Retrieve context documents via Elasticsearch HNSW k-NN Search
+    # 3. Retrieve context via multi-field kNN search across all vec_* fields
     retrieved_context = "No relevant context found in index."
     try:
+        # Build one kNN clause per vector field
+        knn_queries = [
+            {"field": vf, "query_vector": query_vector, "k": 3, "num_candidates": 50}
+            for vf in VECTOR_FIELD_NAMES
+        ]
         search_query = {
-            "knn": {
-                "field": "combined_text_vector",
-                "query_vector": query_vector,
-                "k": 3,
-                "num_candidates": 50
-            },
-            "_source": True  # Fetch the full document metadata records
+            "knn": knn_queries,
+            "_source": True
         }
         res = es.search(index=ES_INDEX, body=search_query)
         hits = res['hits']['hits']
-        
+
         if hits:
-            # Join top records into a text snippet block for the LLM
             retrieved_context = "\n---\n".join([
                 str(hit['_source']) for hit in hits
             ])

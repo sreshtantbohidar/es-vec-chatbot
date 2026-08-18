@@ -19,12 +19,12 @@ documents via k-NN search and answers with a local LLM (Ollama).
 - Python 3.10–3.12 recommended (Python 3.14 may lack PyTorch/sentence-transformers wheels)
 - Elasticsearch 8.x running and reachable
 - Ollama (or any OpenAI-compatible endpoint) serving the chat model
-- An embedding model (default `all-MiniLM-L6-v2`, 384 dims) — downloaded on first run
+- Ollama serving the `nomic-embed-text` embedding model (run `ollama pull nomic-embed-text` if not already available)
 
 ## Setup
 
 ```bash
-pip install elasticsearch sentence-transformers flask requests
+pip install elasticsearch flask requests python-dotenv
 ```
 
 Copy `.env` values (or keep as-is) — key variables:
@@ -39,8 +39,8 @@ Copy `.env` values (or keep as-is) — key variables:
 | `LLM_BASE_URL`    | `http://localhost:11434` | LLM endpoint (OpenAI-compatible `/v1` or native Ollama) |
 | `LLM_API_KEY`     | —                     | Bearer token for the LLM endpoint            |
 | `LLM_MODEL`       | `llama3`              | Chat model name                              |
-| `EMBED_MODEL`     | `all-MiniLM-L6-v2`    | Embedding model (must match migration dims)  |
-| `EMBED_DIMS`      | `384`                 | Vector dimensions (must match the model)     |
+| `EMBED_MODEL`     | `nomic-embed-text`    | Ollama embedding model (768 dims)            |
+| `EMBED_DIMS`      | `768`                 | Vector dimensions (must match the model)     |
 | `APP_HOST`        | `127.0.0.1`           | Flask bind host                              |
 | `APP_PORT`        | `5000`                | Flask bind port                              |
 
@@ -68,7 +68,7 @@ python app.py
 
 Then open `http://<APP_HOST>:<APP_PORT>` (e.g. `http://0.0.0.0:8000`). The chat flow:
 
-1. The user message is embedded with the same model used for ingestion
+1. The user message is embedded via Ollama (same model used for ingestion)
 2. A k-NN search (`combined_text_vector`, cosine) returns the top 3 documents
 3. Retrieved context + session memory are assembled into a prompt and sent to the LLM
 4. The answer is returned; conversation memory is auto-compressed into a rolling summary
