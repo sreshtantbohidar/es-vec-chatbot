@@ -33,7 +33,7 @@ ELASTIC_URL = os.getenv("ES_HOST", "http://localhost:9200")
 ES_USER = os.getenv("ES_USER")
 ES_PASS = os.getenv("ES_PASS")
 ES_VERIFY_CERTS = os.getenv("ES_VERIFY_CERTS", "false").lower() == "true"
-EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
+EMBED_MODEL = os.getenv("EMBED_MODEL") or "nomic-embed-text"
 EMBED_DIMS = int(os.getenv("EMBED_DIMS", "768"))
 OLLAMA_BASE_URL = (os.getenv("OLLAMA_URL") or os.getenv("LLM_BASE_URL") or "http://localhost:11434").rstrip("/")
 SOURCE_INDEX = "fatboy_data"
@@ -173,6 +173,14 @@ def migrate_and_vectorize():
     print(f"  Fields per document: {total_fields}")
     print(f"  Embedding model:     {EMBED_MODEL} ({EMBED_DIMS} dims)")
     print(f"  Ollama endpoint:     {OLLAMA_BASE_URL}")
+
+    # Validate critical config
+    if not EMBED_MODEL:
+        print("\n  FATAL: EMBED_MODEL is empty! Set it in .env or leave unset for default.")
+        sys.exit(1)
+    if not OLLAMA_BASE_URL:
+        print("\n  FATAL: Ollama URL is empty! Set OLLAMA_URL or LLM_BASE_URL in .env.")
+        sys.exit(1)
     print(f"  Batch size:          50 docs")
     print(f"  Retry attempts:      3 (exponential backoff)")
     print(f"  Est. embed calls:    {total_possible_embeddings}")
