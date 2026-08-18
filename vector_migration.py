@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import random
 import argparse
 import requests
 from datetime import timedelta
@@ -63,6 +64,11 @@ def _to_embed_text(field_name, val):
     return str(val).strip()
 
 VECTOR_FIELD_PREFIX = "vec_"
+
+
+def _zero_vector():
+    """Small random vector to avoid cosine similarity zero-magnitude error."""
+    return [random.uniform(-0.01, 0.01) for _ in range(EMBED_DIMS)]
 
 # Initialize clients
 es = Elasticsearch(
@@ -251,12 +257,12 @@ def migrate_and_vectorize(max_docs=None):
                     fields_embedded += 1
                 except Exception as e:
                     print(f"  [ERROR] doc {doc_id[:12]}.. field='{field}': {e}")
-                    source_data[vec_field_name] = [0.0] * EMBED_DIMS
+                    source_data[vec_field_name] = _zero_vector()
                     fields_failed += 1
                     total_errors += 1
                 time.sleep(0.1)
             else:
-                source_data[vec_field_name] = [0.0] * EMBED_DIMS
+                source_data[vec_field_name] = _zero_vector()
                 fields_empty += 1
                 total_empty_fields += 1
 
