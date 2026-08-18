@@ -110,6 +110,27 @@ for _mapping in TYPE_MAPPING.values():
             _seen.add(vec_name)
             VECTOR_FIELD_NAMES.append(vec_name)
 
+# Collect available field labels for the system prompt
+AVAILABLE_FIELDS = []
+_seen_labels = set()
+for _mapping in TYPE_MAPPING.values():
+    for _field, _label in zip(_mapping["fields"], _mapping["field_labels"]):
+        if _label not in _seen_labels:
+            _seen_labels.add(_label)
+            AVAILABLE_FIELDS.append(_label)
+
+# Total doc count (refreshed on first query)
+_total_docs = None
+
+def _get_doc_count():
+    global _total_docs
+    if _total_docs is None:
+        try:
+            _total_docs = es.count(index=ES_INDEX)["count"]
+        except Exception:
+            _total_docs = "unknown"
+    return _total_docs
+
 
 def query_ollama(prompt):
     """Query the local LLM. Supports OpenAI-compatible endpoints (LLM_BASE_URL ending
@@ -201,10 +222,11 @@ def chat():
 
     # 3. Retrieve context via multi-field kNN search across all vec_* fields
     retrieved_context = "No relevant context found in index."
+    num_results = 0
     try:
         # Build one kNN clause per vector field
         knn_queries = [
-            {"field": vf, "query_vector": query_vector, "k": 3, "num_candidates": 50}
+            {"field": vf, "query_vector": query_vector, "k": 10, "num_candidates": 100}
             for vf in VECTOR_FIELD_NAMES
         ]
         search_query = {
@@ -214,31 +236,66 @@ def chat():
         res = es.search(index=ES_INDEX, body=search_query)
         hits = res.get('hits', {}).get('hits', [])
 
-        if hits:
-            retrieved_context = "\n---\n".join([
-                str(hit['_source']) for hit in hits
-            ])
+        # Deduplicate by doc _id and format as readable text
+        seen_ids = set()
+        unique_docs = []
+        for hit in hits:
+            doc_id = hit["_id"]
+            if doc_id not in seen_ids:
+                seen_ids.add(doc_id)
+                unique_docs.append(hit)
+
+        if unique_docs:
+            doc_blocks = []
+            for i, hit in enumerate(unique_docs[:10], 1):
+                src = hit["_source"]
+                # Use combined_text if available (clean, readable)
+                combined = src.get("combined_text", "")
+                if combined:
+                    doc_blocks.append(f"Document {i}:\n{combined}")
+                else:
+                    # Fallback: build from non-vec, non-metadata fields
+                    parts = []
+                    for k, v in src.items():
+                        if not k.startswith("vec_") and k not in ("combined_text",) and v:
+                            parts.append(f"{k}: {v}")
+                    if parts:
+                        doc_blocks.append(f"Document {i}:\n" + "\n".join(parts))
+            if doc_blocks:
+                retrieved_context = "\n\n".join(doc_blocks)
+                num_results = len(doc_blocks)
     except Exception as e:
         print(f"Elasticsearch Query Exception: {e}")
 
     # 4. Construct Context-Aware Prompt using Local Memory Buffers
     recent_history_text = "\n".join([f"{t['role']}: {t['content']}" for t in session['history']])
-    
-    system_prompt = f"""
-    You are an intelligent, helpful RAG chatbot. Answer the user's current query using the provided knowledge documents, historical summary, and recent chat history.
+    total_docs = _get_doc_count()
 
-    [Long-term Summary of Past Conversation]:
-    {session['chat_summary']}
+    system_prompt = f"""You are an intelligent, helpful RAG chatbot for a military intelligence database.
 
-    [Recent Interactive History]:
-    {recent_history_text}
+DATABASE INFO:
+- Total records in database: {total_docs}
+- Records retrieved for this query: {num_results}
+- Available fields: {', '.join(AVAILABLE_FIELDS[:15])}, and others
+- Data includes: location names, coordinates, equipment details, activity dates, enemy formations, infrastructure info
+- Note: Not all fields are populated in every record. Some records may only have a subset of fields.
 
-    [Verified Documents from Elasticsearch Index]:
-    {retrieved_context}
+INSTRUCTIONS:
+- Answer ONLY based on the provided documents below. Do NOT make up information.
+- If the documents don't contain enough information, say so honestly.
+- When listing data, use the actual values from the documents.
+- Format your response clearly with bullet points or tables when presenting multiple records.
+- If asked about a field that doesn't exist in the retrieved records, explain what fields ARE available.
 
-    [Current Query]: {user_message}
+[Chat History]:
+{recent_history_text}
 
-    Refined Answer:"""
+[Retrieved Documents]:
+{retrieved_context}
+
+[User Question]: {user_message}
+
+Answer based on the documents above:"""
 
     # 5. Query Ollama and Update Live Session Logs
     bot_response = query_ollama(system_prompt)
@@ -285,7 +342,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="chat-container">
         <div class="chat-header">
-            <span>Local RAG Chatbot (ES + Ollama)</span>
+            <span>Tectum RAG Chatbot (ES + Ollama)</span>
             <button class="clear-btn" onclick="clearChat()">Clear Memory</button>
         </div>
         <div class="chat-box" id="chatBox">
