@@ -38,6 +38,8 @@ ES_VERIFY_CERTS = os.getenv("ES_VERIFY_CERTS", "false").lower() == "true"
 ES_INDEX = os.getenv("ES_INDEX", "vec_chat_fatboy_data")
 # LLM backend: primary OpenAI-compatible endpoint (LLM_BASE_URL), legacy Ollama vars as fallback
 LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or os.getenv("OLLAMA_URL") or "http://localhost:11434").rstrip("/")
+# Ollama native endpoint (strip /v1 suffix if present — embeddings use /api/embeddings)
+OLLAMA_BASE_URL = LLM_BASE_URL.replace("/v1", "").replace("/chat/completions", "")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL") or os.getenv("OLLAMA_MODEL") or "llama3"
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "30"))
@@ -58,13 +60,17 @@ try:
 except Exception as e:
     print(f"Elasticsearch Initialization Error: {e}")
 
-def _embed_one(text):
-    """Single Ollama embedding call."""
-    url = LLM_BASE_URL + "/api/embeddings"
+def _embed_one(text, max_retries=3):
+    """Single Ollama embedding call with retry."""
+    url = OLLAMA_BASE_URL + "/api/embeddings"
     payload = {"model": EMBED_MODEL, "prompt": text}
-    response = requests.post(url, json=payload, timeout=120)
-    if response.status_code == 200:
-        return response.json()["embedding"]
+    import time
+    for attempt in range(max_retries):
+        response = requests.post(url, json=payload, timeout=120)
+        if response.status_code == 200:
+            return response.json()["embedding"]
+        if attempt < max_retries - 1:
+            time.sleep(2 ** attempt)
     raise RuntimeError(f"Ollama embedding error {response.status_code}: {response.text}")
 
 
@@ -89,7 +95,9 @@ def get_embedding(text, chunk_size=7500):
         return np.mean(vectors, axis=0).tolist()
     except Exception as e:
         print(f"Ollama embedding exception: {e}")
-    return [0.0] * 768
+    # Small random fallback to avoid zero-magnitude cosine similarity error
+    import random
+    return [random.uniform(-0.01, 0.01) for _ in range(768)]
 
 
 # Build list of all per-field vector column names from field_mapping
@@ -204,7 +212,7 @@ def chat():
             "_source": True
         }
         res = es.search(index=ES_INDEX, body=search_query)
-        hits = res['hits']['hits']
+        hits = res.get('hits', {}).get('hits', [])
 
         if hits:
             retrieved_context = "\n---\n".join([
