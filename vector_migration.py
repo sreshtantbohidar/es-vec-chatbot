@@ -49,6 +49,18 @@ for _mapping in TYPE_MAPPING.values():
             _seen_fields.add(_field)
             FIELD_LABEL_PAIRS.append((_field, _label))
 
+
+def _to_embed_text(field_name, val):
+    """Convert a field value to a clean string suitable for embedding.
+    
+    - Lists (e.g. coordinates [lat, lng]) → "lat, lng"
+    - Numbers → str(val)
+    - Strings → stripped str(val)
+    """
+    if isinstance(val, list):
+        return ", ".join(str(v) for v in val)
+    return str(val).strip()
+
 VECTOR_FIELD_PREFIX = "vec_"
 
 # Initialize clients
@@ -195,7 +207,8 @@ def migrate_and_vectorize():
             val = source_data.get(field)
             if val and str(val).strip():
                 try:
-                    embedding = get_embedding(str(val))
+                    embed_text = _to_embed_text(field, val)
+                    embedding = get_embedding(embed_text)
                     source_data[vec_field_name] = embedding
                     total_embed_calls += 1
                     fields_embedded += 1
@@ -215,7 +228,7 @@ def migrate_and_vectorize():
         for field, label in FIELD_LABEL_PAIRS:
             val = source_data.get(field)
             if val and str(val).strip():
-                text_parts.append(f"{label}: {val}")
+                text_parts.append(f"{label}: {_to_embed_text(field, val)}")
         source_data["combined_text"] = " ".join(text_parts)
 
         action = {
