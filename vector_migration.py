@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import argparse
 import requests
 from datetime import timedelta
 from elasticsearch import Elasticsearch, helpers
@@ -150,7 +151,22 @@ def _print_separator():
     print("=" * 70)
 
 
-def migrate_and_vectorize():
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Migrate documents from ES source index to vectorized target index."
+    )
+    parser.add_argument(
+        "--doc", type=int, default=None, metavar="N",
+        help="Process only the first N documents (default: all documents)"
+    )
+    parser.add_argument(
+        "--skip-index", action="store_true",
+        help="Skip index creation (use existing index)"
+    )
+    return parser.parse_args()
+
+
+def migrate_and_vectorize(max_docs=None):
     # --- Pre-flight: count total documents ---
     _print_separator()
     print("PRE-FLIGHT CHECK")
@@ -167,9 +183,18 @@ def migrate_and_vectorize():
     total_fields = len(FIELD_LABEL_PAIRS)
     total_possible_embeddings = (total_docs * total_fields) if total_docs else "unknown"
 
+    # Determine actual doc limit
+    if max_docs is not None and total_docs:
+        effective_total = min(max_docs, total_docs)
+    elif max_docs is not None:
+        effective_total = max_docs
+    else:
+        effective_total = total_docs
+
     print(f"  Source index:        {SOURCE_INDEX}")
     print(f"  Target index:        {NEW_INDEX}")
-    print(f"  Total documents:     {total_docs or 'scanning...'}")
+    print(f"  Total in source:     {total_docs or 'scanning...'}")
+    print(f"  Processing limit:    {max_docs or 'ALL'} docs")
     print(f"  Fields per document: {total_fields}")
     print(f"  Embedding model:     {EMBED_MODEL} ({EMBED_DIMS} dims)")
     print(f"  Ollama endpoint:     {OLLAMA_BASE_URL}")
@@ -183,7 +208,8 @@ def migrate_and_vectorize():
         sys.exit(1)
     print(f"  Batch size:          50 docs")
     print(f"  Retry attempts:      3 (exponential backoff)")
-    print(f"  Est. embed calls:    {total_possible_embeddings}")
+    est = (effective_total * total_fields) if effective_total else "unknown"
+    print(f"  Est. embed calls:    {est}")
     _print_separator()
 
     # --- Begin migration ---
@@ -203,6 +229,9 @@ def migrate_and_vectorize():
     _print_separator()
 
     for doc_num, doc in enumerate(scan_iterator, start=1):
+        # Stop if we've hit the --doc limit
+        if max_docs and doc_num > max_docs:
+            break
         source_data = doc["_source"]
         doc_id = doc["_id"]
         fields_embedded = 0
@@ -251,12 +280,13 @@ def migrate_and_vectorize():
         if doc_num % 10 == 0 or fields_failed > 0 or (now - last_print_time) > 5:
             elapsed = now - start_time
             speed = total_embed_calls / elapsed if elapsed > 0 else 0
-            remaining = total_docs - total_indexed - len(batch) if total_docs else None
-            eta = remaining / speed if speed > 0 and remaining else None
-            pct = (total_indexed / total_docs * 100) if total_docs else 0
+            display_total = effective_total or total_docs or '?'
+            remaining = (effective_total or total_docs or 0) - total_indexed - len(batch)
+            eta = remaining / speed if speed > 0 and remaining and remaining > 0 else None
+            pct = (doc_num / display_total * 100) if display_total != '?' else 0
 
             print(
-                f"  [{doc_num:>6}/{total_docs or '?'}] "
+                f"  [{doc_num:>6}/{display_total}] "
                 f"({pct:5.1f}%) "
                 f"embed={fields_embedded}/{total_fields} "
                 f"empty={fields_empty} "
@@ -307,9 +337,13 @@ def migrate_and_vectorize():
 
 
 if __name__ == "__main__":
+    args = parse_args()
     _print_separator()
     print("VECTOR MIGRATION — Per-Field Embedding")
     _print_separator()
-    create_new_index()
-    migrate_and_vectorize()
+    if not args.skip_index:
+        create_new_index()
+    else:
+        print("Skipping index creation (--skip-index)")
+    migrate_and_vectorize(max_docs=args.doc)
     print("\nMigration successful!")
