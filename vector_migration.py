@@ -217,7 +217,7 @@ def migrate_and_vectorize(max_docs=None):
     scan_iterator = helpers.scan(es, query=query, index=SOURCE_INDEX, scroll="5m", size=100)
 
     batch = []
-    batch_size = 50
+    batch_size = 20
     total_indexed = 0
     total_embed_calls = 0
     total_empty_fields = 0
@@ -301,27 +301,34 @@ def migrate_and_vectorize(max_docs=None):
         # --- Flush batch to ES ---
         if len(batch) >= batch_size:
             bulk_start = time.time()
-            try:
-                helpers.bulk(es, batch)
-                bulk_time = time.time() - bulk_start
-                total_indexed += len(batch)
-                print(
-                    f"  >> BATCH FLUSHED: {len(batch)} docs to ES ({bulk_time:.1f}s) "
-                    f"| total_indexed={total_indexed}"
-                )
-            except Exception as e:
-                total_indexed += len(batch)
-                print(f"  >> BATCH ERROR during ES write: {e}")
+            success, errors = helpers.bulk(es, batch, raise_on_error=False)
+            bulk_time = time.time() - bulk_start
+            total_indexed += len(batch)
+            if errors:
+                # Show first 3 errors for diagnosis
+                for err in errors[:3]:
+                    op_type = list(err.keys())[0] if err else '?'
+                    doc_info = err.get(op_type, {})
+                    reason = doc_info.get('error', {}).get('reason', str(doc_info.get('error', '')))[:200]
+                    print(f"  >> BATCH ERROR [{op_type}] id={doc_info.get('_id', '?')}: {reason}")
+                if len(errors) > 3:
+                    print(f"  >> ... and {len(errors) - 3} more errors")
+            print(
+                f"  >> BATCH FLUSHED: {success}/{len(batch)} docs to ES ({bulk_time:.1f}s) "
+                f"| total_indexed={total_indexed}"
+            )
             batch = []
 
     # --- Flush remaining batch ---
     if batch:
-        try:
-            helpers.bulk(es, batch)
-            total_indexed += len(batch)
-        except Exception as e:
-            total_indexed += len(batch)
-            print(f"  >> FINAL BATCH ERROR: {e}")
+        success, errors = helpers.bulk(es, batch, raise_on_error=False)
+        total_indexed += len(batch)
+        if errors:
+            for err in errors[:3]:
+                op_type = list(err.keys())[0] if err else '?'
+                doc_info = err.get(op_type, {})
+                reason = doc_info.get('error', {}).get('reason', str(doc_info.get('error', '')))[:200]
+                print(f"  >> FINAL BATCH ERROR [{op_type}] id={doc_info.get('_id', '?')}: {reason}")
 
     elapsed_total = time.time() - start_time
     _print_separator()
