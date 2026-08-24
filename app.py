@@ -266,10 +266,106 @@ _AGG_KEYWORDS = (
     "all locations", "every record", "total number", "how much",
 )
 
+# Enumeration-intent phrases that, combined with a recognized field keyword
+# (e.g. "infrastructure"), justify a FULL DATABASE terms aggregation.
+_LIST_INTENT = (
+    "types of", "type of", "kinds of", "kind of", "what ", "which ",
+    "list", "enumerate", "categories of", "category of", "variety of",
+)
+
 
 def _is_aggregation_query(message):
     lowered = message.lower()
     return any(kw in lowered for kw in _AGG_KEYWORDS)
+
+
+def _wants_enumeration(message):
+    """True when the message asks to enumerate something (types, list, which...)."""
+    lowered = message.lower()
+    return any(kw in lowered for kw in _AGG_KEYWORDS) or any(kw in lowered for kw in _LIST_INTENT)
+
+
+# Maps question keywords -> source fields whose distinct values can be
+# aggregated across the FULL database via ES terms aggregations.
+# Field names verified against live ES mappings (see also field_mapping.py).
+_LISTABLE_FIELDS = [
+    (("location", "place"), [("location_name", "Location Name"),
+                             ("base_location_name", "Base Location Name"),
+                             ("start_location_name", "Start Location Name"),
+                             ("end_location_name", "End Location Name"),
+                             ("general_area", "General Area"),
+                             ("mil_dist_loc_name", "Military District Location")]),
+    (("equipment", "weapon", "artillery", "howitzer", "mrl", "tank"), [
+        ("equipment_name", "Equipment Name"),
+        ("equipment_type", "Equipment Type")]),
+    (("infra", "airfield", "storage", "camp"), [("infra_type", "Infra Type"),
+                                                ("infra_name", "Infra Name"),
+                                                ("infra_stage", "Infra Stage")]),
+    (("radar", "elint", "sigint"), [("radar_type", "Radar Type"),
+                                    ("radar_name", "Radar Name"),
+                                    ("category", "Category")]),
+    (("formation", "orbat", "corps", "brigade", "division"), [
+        ("enemy_formation_name", "Enemy Formation Name"),
+        ("orbat_title", "ORBAT Title"),
+        ("formation_type", "Formation Type"),
+        ("army_name", "Army Name"),
+        ("div_name", "Division Name"),
+        ("theatre_comd_name", "Theatre Command")]),
+    (("pass", "transgression", "sighting"), [("pass_name", "Pass Name"),
+                                             ("transgression_sighting_type", "Transgression/Sighting Type")]),
+    (("training", "exercise"), [("training_name", "Training Name"),
+                                ("training_type", "Training Type"),
+                                ("training_force_type", "Training Force Type")]),
+    (("person", "officer", "commander"), [("person_name", "Person Name"),
+                                          ("designation", "Designation")]),
+]
+
+_AGG_MAX_VALUES = 300  # cap on distinct values fed to the LLM per field
+
+
+def _detect_list_fields(message):
+    """Return [(field_name, label)] the message asks to enumerate, or []."""
+    lowered = message.lower()
+    for keywords, fields in _LISTABLE_FIELDS:
+        if any(kw in lowered for kw in keywords):
+            return fields
+    return []
+
+
+def _terms_agg(field_name, size=_AGG_MAX_VALUES):
+    """Distinct-value counts for one field across the WHOLE index."""
+    # Dynamic text mappings expose a .keyword sub-field; try it first.
+    for candidate in (f"{field_name}.keyword", field_name):
+        body = {"size": 0, "aggs": {"vals": {"terms": {"field": candidate, "size": size}}}}
+        res = es.search(index=ES_INDEX, body=body)
+        buckets = res.get("aggregations", {}).get("vals", {}).get("buckets", [])
+        if buckets:
+            return buckets
+        # No error means the field exists but was empty — try next candidate
+    return []
+
+
+def _build_full_listing(user_message):
+    """Aggregate requested fields across the entire database.
+
+    Returns (context_text, ok). Falls back to None when no field matched.
+    """
+    fields = _detect_list_fields(user_message)
+    if not fields:
+        return None
+    blocks = []
+    for field, label in fields:
+        buckets = _terms_agg(field)
+        if not buckets:
+            continue
+        lines = [f'{label} — {b["key"]} ({b["doc_count"]} records)' for b in buckets]
+        total_distinct = len(buckets)
+        suffix = "" if total_distinct < _AGG_MAX_VALUES else " (first 300 shown)"
+        blocks.append(
+            f"FULL DATABASE AGGREGATION — {label}: {total_distinct} distinct values{suffix}\n"
+            + "\n".join(lines)
+        )
+    return "\n\n".join(blocks) if blocks else None
 
 
 def _fetch_all_docs(max_docs=50):
@@ -288,6 +384,11 @@ def _retrieve_context(user_message, query_vector):
     goes through multi-field kNN.
     """
     try:
+        # Full-database terms aggregation when the question asks to enumerate
+        # a recognized field type (locations, equipment, radars, ...).
+        full_listing = _build_full_listing(user_message)
+        if full_listing and _wants_enumeration(user_message):
+            return full_listing, 0  # num_results=0 signals aggregated listing
         if _is_aggregation_query(user_message):
             hits = _fetch_all_docs()
         else:
@@ -365,6 +466,7 @@ INSTRUCTIONS:
 - If the documents don't contain enough information, say so honestly.
 - When asked how many records the DATABASE has, use "Total records in database" ({total_docs}), NOT the number of documents provided. The provided documents are only a sample relevant to the question.
 - When asked to list or show all of something (e.g. all locations), enumerate every distinct value across ALL provided documents, not just the first few.
+- If a section labeled "FULL DATABASE AGGREGATION" is present, it contains exact distinct values and record counts computed over the ENTIRE database — present them completely (grouped/summarized if very long) and do not caveat that it may be incomplete.
 - When referencing a document to the user, cite it as its stable id shown in parentheses, e.g. "document (id: abc123)".
 - When listing data, use the actual values from the documents.
 - Format your response clearly with bullet points or tables when presenting multiple records.

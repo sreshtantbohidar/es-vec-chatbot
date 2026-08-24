@@ -17,7 +17,7 @@ TYPE_MAPPING = {
     "force": {
         "types": ["force disposition analysis", "event force disposition analysis"],
         "fields": ["location_name", "coordinates", "base_location_name", "base_coordinates",
-                   "enemy_formation_name", "orbate_title", "description"],
+                   "enemy_formation_name", "orbat_title", "description"],
         "field_labels": ["Location Name", "Coordinates", "Base Location Name", "Base Coordinates",
                          "Enemy Formation Name", "ORBAT Title", "Description"],
     },
@@ -29,7 +29,7 @@ TYPE_MAPPING = {
     "air_aspects": {
         "types": ["air aspects analysis", "event air aspects analysis"],
         "fields": ["location_name", "coordinates", "infra_name", "infra_type", "equipment_name",
-                   "equipement_type", "count", "airfield_type"],
+                   "equipment_type", "count", "airfield_type"],
         "field_labels": ["Location Name", "Coordinates", "Infra Name", "Infra Type", "Equipment Name",
                          "Equipment Type", "Count", "Airfield Type"],
     },
