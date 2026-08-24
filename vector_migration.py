@@ -262,7 +262,7 @@ def migrate_and_vectorize(max_docs=None):
     if not OLLAMA_BASE_URL:
         print("\n  FATAL: Ollama URL is empty! Set OLLAMA_URL or LLM_BASE_URL in .env.")
         sys.exit(1)
-    print(f"  Batch size:          {batch_size} docs")
+    print(f"  Batch size:          {BATCH_SIZE} docs")
     print(f"  Retry attempts:      3 (exponential backoff)")
     est = (effective_total * total_fields) if effective_total else "unknown"
     print(f"  Est. embed calls:    {est}")
