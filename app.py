@@ -4,6 +4,7 @@ import time
 import random
 import threading
 import numpy as np
+from datetime import datetime
 import requests
 from flask import Flask, request, jsonify, render_template_string, session
 from elasticsearch import Elasticsearch
@@ -64,7 +65,16 @@ LLM_BASE_URL = (os.getenv("LLM_BASE_URL") or os.getenv("OLLAMA_URL") or "http://
 OLLAMA_BASE_URL = LLM_BASE_URL.replace("/v1", "").replace("/chat/completions", "")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL") or os.getenv("OLLAMA_MODEL") or "llama3"
-LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "30"))
+def _env_int(name, default):
+    """Read an int env var, stripping inline comments like '120  # note'."""
+    raw = os.getenv(name, "")
+    raw = raw.split("#", 1)[0].strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+LLM_TIMEOUT = _env_int("LLM_TIMEOUT", 30)
 EMBED_MODEL = os.getenv("EMBED_MODEL") or "nomic-embed-text"
 APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
 APP_PORT = int(os.getenv("APP_PORT", "5000"))
@@ -385,15 +395,29 @@ _LOCATION_FILTER_FIELDS = (
 )
 
 _DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b")
+_MONTH_NAMES = ("january", "february", "march", "april", "may", "june", "july",
+                "august", "september", "october", "november", "december")
+_YEAR_RE = re.compile(r"\b(20\d{2})\b")
 _JUNK_LOCATIONS = {"unknown", "location not known", "na", "none"}
 
 
 def _extract_entities(message):
-    """Pull location names and dates mentioned in the message (plus history)."""
+    """Pull locations, exact dates, and month/year ranges from the message."""
     lowered = message.lower()
     dates = _DATE_RE.findall(lowered)
+
+    # Month (+ optional year) range: "summary for april 2026", "records in may"
+    month_year = None
+    year_match = _YEAR_RE.search(lowered)
+    for i, name in enumerate(_MONTH_NAMES, 1):
+        if name in lowered:
+            month_year = {"month": i, "year": int(year_match.group(1)) if year_match else None}
+            break
+
+    # Bare year: "summarise records from year 2026" (only when no exact date given)
+    year_only = int(year_match.group(1)) if (year_match and not month_year and not dates) else None
+
     locations = []
-    # Look for "in/at/near <place>" and "<place> as location" patterns
     for m in re.finditer(r"(?:\bin|\bat|\bnear|\bfor)\s+location\s+(?:as\s+)?([a-z][a-z\s]{2,40})", lowered):
         loc = m.group(1).strip().rstrip(" ?.,!")
         if loc and loc not in _JUNK_LOCATIONS:
@@ -402,7 +426,66 @@ def _extract_entities(message):
         loc = m.group(1).strip()
         if loc and loc not in _JUNK_LOCATIONS and loc not in locations:
             locations.append(loc)
-    return locations, dates
+    return locations, dates, month_year, year_only
+
+
+def _resolve_locations(locations):
+    """Fuzzy-match user-typed place names against distinct values in the index.
+
+    Fixes typos like 'afganistan' -> 'afghanistan'. Returns resolved names
+    (original casing preserved) or [].
+    """
+    if not locations:
+        return []
+    try:
+        res = es.search(index=ES_INDEX, body={
+            "size": 0,
+            "aggs": {"vals": {"terms": {"field": "location_name.keyword", "size": 5000}}},
+        })
+        known = [b["key"] for b in res["aggregations"]["vals"]["buckets"]
+                 if b["key"].lower() not in _JUNK_LOCATIONS]
+    except Exception as e:
+        print(f"Location resolve exception: {e}")
+        return locations
+    import difflib
+    lowered_known = {k.lower(): k for k in known}
+    resolved = []
+    for loc in locations:
+        if loc in lowered_known:                      # exact
+            resolved.append(lowered_known[loc])
+            continue
+        close = difflib.get_close_matches(loc, list(lowered_known.keys()), n=1, cutoff=0.75)
+        if close:                                     # typo / spelling variant
+            resolved.append(lowered_known[close[0]])
+        else:                                         # substring match
+            partial = [k for k in known if loc in k.lower()]
+            if partial:
+                resolved.append(partial[0])
+    return resolved
+
+
+def _search_by_date_range(month_year=None, year_only=None, max_docs=30):
+    """Fetch docs whose activity_date falls in a month/year or whole year."""
+    must = [{"exists": {"field": "activity_date"}}]
+    if month_year:
+        y = month_year["year"] or "*"
+        start = f"{y}-{month_year['month']:02d}-01"
+        end = f"{y}-{month_year['month']:02d}-31"
+        must.append({"range": {"activity_date": {"gte": start, "lte": end}}})
+    elif year_only:
+        must.append({"range": {"activity_date": {"gte": f"{year_only}-01-01",
+                                                 "lte": f"{year_only}-12-31"}}})
+    else:
+        return None
+    try:
+        res = es.search(index=ES_INDEX, body={
+            "query": {"bool": {"must": must}}, "size": max_docs, "sort": ["_doc"],
+        })
+        hits = res.get("hits", {}).get("hits", [])
+        return hits or []
+    except Exception as e:
+        print(f"Date range search exception: {e}")
+        return None
 
 
 def _search_by_entity(locations, dates, max_docs=30):
@@ -440,19 +523,62 @@ def _retrieve_context(user_message, query_vector):
     """
     try:
         hits = None
-        # 1) Exact-match entity retrieval: "give details of all records with
-        # location as afghanistan" / follow-ups naming a place + date. Beats
-        # kNN because it guarantees completeness for named entities.
-        locations, dates = _extract_entities(user_message)
+        # 1) Entity retrieval: locations (fuzzy-resolved), exact dates,
+        # month/year or year ranges. Beats kNN for named entities & dates.
+        locations, dates, month_year, year_only = _extract_entities(user_message)
+        resolved = []
         if locations:
-            entity_hits = _search_by_entity(locations, dates)
-            if entity_hits:
-                hits = entity_hits  # fall through to shared dedupe/format below
-            elif dates:
-                # Date-filtered search found nothing — report that honestly
-                return (f"Entity filter: location={locations}, date={dates}. "
-                        f"No records match exactly."), 0
-            # else: no match and no date — fall back to kNN below
+            resolved = _resolve_locations(locations)
+            if resolved:
+                entity_hits = _search_by_entity(resolved, dates)
+                if entity_hits:
+                    hits = entity_hits
+                elif not dates:
+                    # Location known but date filtered nothing out; drop date filter
+                    pass
+        if hits is None and (month_year or year_only):
+            range_hits = _search_by_date_range(month_year, year_only)
+            if range_hits:
+                hits = range_hits
+        if hits is None and dates:
+            # Exact date mentioned but no location: search all docs on that date
+            date_clauses = [{"term": {"activity_date.keyword": d}} for d in dates]
+            res = es.search(index=ES_INDEX, body={
+                "query": {"bool": {"should": date_clauses, "minimum_should_match": 1}},
+                "size": 30, "sort": ["_doc"],
+            })
+            dhits = res.get("hits", {}).get("hits", [])
+            if dhits:
+                hits = dhits
+
+        # 1b) Near-date fallback: when a location matched but the exact day
+        # didn't, surface the closest dated records instead of nothing.
+        if hits is None and resolved:
+            target_ms = 0
+            if dates and re.match(r"\d{4}-\d{2}-\d{2}", dates[0]):
+                target_ms = int(datetime.strptime(dates[0], "%Y-%m-%d").timestamp() * 1000)
+            body = {
+                "query": {"bool": {"should": [
+                    {"term": {f"{f}.keyword": v}} for v in resolved for f in _LOCATION_FILTER_FIELDS
+                ], "minimum_should_match": 1,
+                    "filter": [{"exists": {"field": "activity_date"}}]}},
+                "size": 10,
+                "sort": [{"_script": {
+                    "type": "number",
+                    "script": {
+                        "lang": "painless",
+                        "source": "long t = (long) params['target']; if (doc[params.fld].empty) return 9000000000000L; return Math.abs(doc[params.fld].value.toInstant().toEpochMilli() - t)",
+                        "params": {"target": target_ms, "fld": "activity_date"},
+                    },
+                }}],
+            }
+            try:
+                res = es.search(index=ES_INDEX, body=body)
+                nhits = res.get("hits", {}).get("hits", [])
+                if nhits:
+                    hits = nhits
+            except Exception as e:
+                print(f"Near-date search exception: {e}")
 
         # 2) Full-database terms aggregation when the question asks to enumerate
         # a recognized field type (locations, equipment, radars, ...).
