@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import random
 import threading
@@ -377,6 +378,60 @@ def _fetch_all_docs(max_docs=50):
     return res.get("hits", {}).get("hits", [])
 
 
+# Fields that can carry a location entity for exact-match filtering.
+_LOCATION_FILTER_FIELDS = (
+    "location_name", "base_location_name", "start_location_name",
+    "end_location_name", "general_area", "mil_dist_loc_name",
+)
+
+_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b")
+_JUNK_LOCATIONS = {"unknown", "location not known", "na", "none"}
+
+
+def _extract_entities(message):
+    """Pull location names and dates mentioned in the message (plus history)."""
+    lowered = message.lower()
+    dates = _DATE_RE.findall(lowered)
+    locations = []
+    # Look for "in/at/near <place>" and "<place> as location" patterns
+    for m in re.finditer(r"(?:\bin|\bat|\bnear|\bfor)\s+location\s+(?:as\s+)?([a-z][a-z\s]{2,40})", lowered):
+        loc = m.group(1).strip().rstrip(" ?.,!")
+        if loc and loc not in _JUNK_LOCATIONS:
+            locations.append(loc)
+    for m in re.finditer(r"location\s+(?:as\s+)?([a-z][a-z\s]{2,40}?)(?:\s+and\b|$|\?|with)", lowered):
+        loc = m.group(1).strip()
+        if loc and loc not in _JUNK_LOCATIONS and loc not in locations:
+            locations.append(loc)
+    return locations, dates
+
+
+def _search_by_entity(locations, dates, max_docs=30):
+    """Exact-match retrieval: docs whose location field equals a named place
+    (optionally filtered by activity date). Returns hits or None."""
+    if not locations:
+        return None
+    should = []
+    for loc in locations:
+        variants = {loc, loc.title()}
+        for variant in variants:
+            for field in _LOCATION_FILTER_FIELDS:
+                should.append({"term": {f"{field}.keyword": variant}})
+    body = {
+        "query": {"bool": {"should": should, "minimum_should_match": 1}},
+        "size": max_docs,
+        "sort": ["_doc"],
+    }
+    if dates:
+        date_clauses = [{"term": {"activity_date.keyword": d}} for d in dates]
+        body["query"]["bool"]["must"] = {"bool": {"should": date_clauses, "minimum_should_match": 0}}
+    try:
+        res = es.search(index=ES_INDEX, body=body)
+        return res.get("hits", {}).get("hits", [])
+    except Exception as e:
+        print(f"Entity search exception: {e}")
+        return None
+
+
 def _retrieve_context(user_message, query_vector):
     """Return (retrieved_context_text, num_results).
 
@@ -384,20 +439,36 @@ def _retrieve_context(user_message, query_vector):
     goes through multi-field kNN.
     """
     try:
-        # Full-database terms aggregation when the question asks to enumerate
+        # 1) Exact-match entity retrieval: "give details of all records with
+        # location as afghanistan" / follow-ups naming a place + date. Beats
+        # kNN because it guarantees completeness for named entities.
+        locations, dates = _extract_entities(user_message)
+        if locations:
+            hits = _search_by_entity(locations, dates)
+            if hits:
+                pass  # fall through to shared dedupe/format below
+            elif not dates:
+                hits = None  # nothing matched; fall back to kNN
+            else:
+                # Date-filtered search found nothing — report that honestly
+                return (f"Entity filter: location={locations}, date={dates}. "
+                        f"No records match exactly."), 0
+
+        # 2) Full-database terms aggregation when the question asks to enumerate
         # a recognized field type (locations, equipment, radars, ...).
-        full_listing = _build_full_listing(user_message)
-        if full_listing and _wants_enumeration(user_message):
-            return full_listing, 0  # num_results=0 signals aggregated listing
-        if _is_aggregation_query(user_message):
-            hits = _fetch_all_docs()
-        else:
-            knn_queries = [
-                {"field": vf, "query_vector": query_vector, "k": 10, "num_candidates": 100}
-                for vf in VECTOR_FIELD_NAMES
-            ]
-            res = es.search(index=ES_INDEX, body={"knn": knn_queries, "_source": True})
-            hits = res.get("hits", {}).get("hits", [])
+        if not hits:
+            full_listing = _build_full_listing(user_message)
+            if full_listing and _wants_enumeration(user_message):
+                return full_listing, 0  # num_results=0 signals aggregated listing
+            if _is_aggregation_query(user_message):
+                hits = _fetch_all_docs()
+            else:
+                knn_queries = [
+                    {"field": vf, "query_vector": query_vector, "k": 10, "num_candidates": 100}
+                    for vf in VECTOR_FIELD_NAMES
+                ]
+                res = es.search(index=ES_INDEX, body={"knn": knn_queries, "_source": True})
+                hits = res.get("hits", {}).get("hits", [])
 
         # Deduplicate by stable doc _id
         seen_ids = set()
@@ -445,6 +516,7 @@ def chat():
     manage_memory()
 
     # 2-3. Vectorize and retrieve context (kNN, or broad fetch for listing questions)
+    t0 = time.time()
     query_vector = get_embedding(user_message)
     retrieved_context, num_results = _retrieve_context(user_message, query_vector)
 
@@ -495,7 +567,8 @@ Answer based on the documents above:"""
     return jsonify({
         "response": bot_response,
         "debug_summary": session['chat_summary'],
-        "debug_history_len": len(session['history'])
+        "debug_history_len": len(session['history']),
+        "elapsed_seconds": round(time.time() - t0, 1)
     })
 
 
@@ -521,6 +594,7 @@ HTML_TEMPLATE = """
         .message { margin-bottom: 15px; padding: 10px 15px; border-radius: 6px; max-width: 80%; }
         .user { background: #e1ffc7; align-self: flex-end; margin-left: auto; }
         .bot { background: #f1f0f0; align-self: flex-start; }
+        .msg-meta { display: block; font-size: 11px; color: #888; margin-top: 4px; }
         .input-area { display: flex; padding: 15px; background: #fafafa; }
         input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
         button { background: #007bff; color: white; border: none; padding: 10px 20px; margin-left: 10px; border-radius: 4px; cursor: pointer; }
@@ -543,13 +617,17 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
+        function nowTime() {
+            return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
         async function sendMessage() {
             const input = document.getElementById('userInput');
             const message = input.value.trim();
             if(!message) return;
-            
+
             appendMessage(message, 'user');
             input.value = '';
+            const startedAt = Date.now();
 
             try {
                 const res = await fetch('/chat', {
@@ -557,18 +635,30 @@ HTML_TEMPLATE = """
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ message })
                 });
+                if (res.status === 503) {
+                    appendMessage('The LLM backend is not responding. Please try again.', 'bot', 0);
+                    return;
+                }
                 const data = await res.json();
-                appendMessage(data.response, 'bot');
+                // Prefer server-measured time (retrieval + LLM); fall back to client-side
+                const elapsed = data.elapsed_seconds || ((Date.now() - startedAt) / 1000).toFixed(1);
+                appendMessage(data.response, 'bot', elapsed);
             } catch(e) {
-                appendMessage('Failed to get a response.', 'bot');
+                appendMessage('Failed to get a response.', 'bot', 0);
             }
         }
         function handleKey(e) { if(e.key === 'Enter') sendMessage(); }
-        function appendMessage(text, sender) {
+        function appendMessage(text, sender, elapsedSeconds) {
             const box = document.getElementById('chatBox');
             const div = document.createElement('div');
             div.className = `message ${sender}`;
             div.innerText = text;
+            const meta = document.createElement('span');
+            meta.className = 'msg-meta';
+            let label = nowTime();
+            if (sender === 'bot' && elapsedSeconds) label += ` · ${elapsedSeconds}s`;
+            meta.innerText = label;
+            div.appendChild(meta);
             box.appendChild(div);
             box.scrollTop = box.scrollHeight;
         }
