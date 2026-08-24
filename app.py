@@ -258,6 +258,79 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
+# Keywords that signal an aggregation/listing question ("show me all locations",
+# "how many records...") rather than a similarity question. These are better
+# served by a broad fetch than kNN, which returns only wording-similar docs.
+_AGG_KEYWORDS = (
+    "how many", "count", "list all", "show all", "show me all", "all records",
+    "all locations", "every record", "total number", "how much",
+)
+
+
+def _is_aggregation_query(message):
+    lowered = message.lower()
+    return any(kw in lowered for kw in _AGG_KEYWORDS)
+
+
+def _fetch_all_docs(max_docs=50):
+    """Broad fetch for listing/counting questions: recent docs with all fields."""
+    res = es.search(
+        index=ES_INDEX,
+        body={"query": {"match_all": {}}, "size": max_docs, "sort": ["_doc"]},
+    )
+    return res.get("hits", {}).get("hits", [])
+
+
+def _retrieve_context(user_message, query_vector):
+    """Return (retrieved_context_text, num_results).
+
+    Aggregation-style questions get a broad match_all fetch; everything else
+    goes through multi-field kNN.
+    """
+    try:
+        if _is_aggregation_query(user_message):
+            hits = _fetch_all_docs()
+        else:
+            knn_queries = [
+                {"field": vf, "query_vector": query_vector, "k": 10, "num_candidates": 100}
+                for vf in VECTOR_FIELD_NAMES
+            ]
+            res = es.search(index=ES_INDEX, body={"knn": knn_queries, "_source": True})
+            hits = res.get("hits", {}).get("hits", [])
+
+        # Deduplicate by stable doc _id
+        seen_ids = set()
+        unique_docs = []
+        for hit in hits:
+            doc_id = hit["_id"]
+            if doc_id not in seen_ids:
+                seen_ids.add(doc_id)
+                unique_docs.append(hit)
+
+        if not unique_docs:
+            return "No relevant context found in index.", 0
+
+        doc_blocks = []
+        for i, hit in enumerate(unique_docs[:10], 1):
+            src = hit["_source"]
+            # Stable ID header so follow-ups can reference docs unambiguously
+            header = f"Document {i} (id: {hit['_id']}):"
+            combined = src.get("combined_text", "")
+            if combined:
+                doc_blocks.append(f"{header}\n{combined}")
+            else:
+                parts = []
+                for k, v in src.items():
+                    if not k.startswith("vec_") and k != "combined_text" and v:
+                        parts.append(f"{k}: {v}")
+                if parts:
+                    doc_blocks.append(f"{header}\n" + "\n".join(parts))
+        return "\n\n".join(doc_blocks), len(doc_blocks)
+    except Exception as e:
+        print(f"Elasticsearch Query Exception: {e}")
+        return "No relevant context found in index.", 0
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
     """Main RAG Chat Pipeline with Infinite Memory Handling."""
@@ -270,55 +343,9 @@ def chat():
         session['history'] = []
     manage_memory()
 
-    # 2. Vectorize user message for ES retrieval
+    # 2-3. Vectorize and retrieve context (kNN, or broad fetch for listing questions)
     query_vector = get_embedding(user_message)
-
-    # 3. Retrieve context via multi-field kNN search across all vec_* fields
-    retrieved_context = "No relevant context found in index."
-    num_results = 0
-    try:
-        # Build one kNN clause per vector field
-        knn_queries = [
-            {"field": vf, "query_vector": query_vector, "k": 10, "num_candidates": 100}
-            for vf in VECTOR_FIELD_NAMES
-        ]
-        search_query = {
-            "knn": knn_queries,
-            "_source": True
-        }
-        res = es.search(index=ES_INDEX, body=search_query)
-        hits = res.get('hits', {}).get('hits', [])
-
-        # Deduplicate by doc _id and format as readable text
-        seen_ids = set()
-        unique_docs = []
-        for hit in hits:
-            doc_id = hit["_id"]
-            if doc_id not in seen_ids:
-                seen_ids.add(doc_id)
-                unique_docs.append(hit)
-
-        if unique_docs:
-            doc_blocks = []
-            for i, hit in enumerate(unique_docs[:10], 1):
-                src = hit["_source"]
-                # Use combined_text if available (clean, readable)
-                combined = src.get("combined_text", "")
-                if combined:
-                    doc_blocks.append(f"Document {i}:\n{combined}")
-                else:
-                    # Fallback: build from non-vec, non-metadata fields
-                    parts = []
-                    for k, v in src.items():
-                        if not k.startswith("vec_") and k not in ("combined_text",) and v:
-                            parts.append(f"{k}: {v}")
-                    if parts:
-                        doc_blocks.append(f"Document {i}:\n" + "\n".join(parts))
-            if doc_blocks:
-                retrieved_context = "\n\n".join(doc_blocks)
-                num_results = len(doc_blocks)
-    except Exception as e:
-        print(f"Elasticsearch Query Exception: {e}")
+    retrieved_context, num_results = _retrieve_context(user_message, query_vector)
 
     # 4. Construct Context-Aware Prompt using Local Memory Buffers
     recent_history_text = "\n".join([f"{t['role']}: {t['content']}" for t in session['history']])
@@ -328,7 +355,7 @@ def chat():
 
 DATABASE INFO:
 - Total records in database: {total_docs}
-- Records retrieved for this query: {num_results}
+- Documents provided with this prompt: {num_results}
 - Available fields: {', '.join(AVAILABLE_FIELDS[:15])}, and others
 - Data includes: location names, coordinates, equipment details, activity dates, enemy formations, infrastructure info
 - Note: Not all fields are populated in every record. Some records may only have a subset of fields.
@@ -336,6 +363,9 @@ DATABASE INFO:
 INSTRUCTIONS:
 - Answer ONLY based on the provided documents below. Do NOT make up information.
 - If the documents don't contain enough information, say so honestly.
+- When asked how many records the DATABASE has, use "Total records in database" ({total_docs}), NOT the number of documents provided. The provided documents are only a sample relevant to the question.
+- When asked to list or show all of something (e.g. all locations), enumerate every distinct value across ALL provided documents, not just the first few.
+- When referencing a document to the user, cite it as its stable id shown in parentheses, e.g. "document (id: abc123)".
 - When listing data, use the actual values from the documents.
 - Format your response clearly with bullet points or tables when presenting multiple records.
 - If asked about a field that doesn't exist in the retrieved records, explain what fields ARE available.
