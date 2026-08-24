@@ -470,7 +470,9 @@ def _search_by_date_range(month_year=None, year_only=None, max_docs=30):
     if month_year:
         y = month_year["year"] or "*"
         start = f"{y}-{month_year['month']:02d}-01"
-        end = f"{y}-{month_year['month']:02d}-31"
+        import calendar
+        last_day = calendar.monthrange(int(month_year["year"]) if month_year["year"] else 2024, month_year["month"])[1]
+        end = f"{y}-{month_year['month']:02d}-{last_day:02d}"
         must.append({"range": {"activity_date": {"gte": start, "lte": end}}})
     elif year_only:
         must.append({"range": {"activity_date": {"gte": f"{year_only}-01-01",
