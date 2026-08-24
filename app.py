@@ -439,20 +439,20 @@ def _retrieve_context(user_message, query_vector):
     goes through multi-field kNN.
     """
     try:
+        hits = None
         # 1) Exact-match entity retrieval: "give details of all records with
         # location as afghanistan" / follow-ups naming a place + date. Beats
         # kNN because it guarantees completeness for named entities.
         locations, dates = _extract_entities(user_message)
         if locations:
-            hits = _search_by_entity(locations, dates)
-            if hits:
-                pass  # fall through to shared dedupe/format below
-            elif not dates:
-                hits = None  # nothing matched; fall back to kNN
-            else:
+            entity_hits = _search_by_entity(locations, dates)
+            if entity_hits:
+                hits = entity_hits  # fall through to shared dedupe/format below
+            elif dates:
                 # Date-filtered search found nothing — report that honestly
                 return (f"Entity filter: location={locations}, date={dates}. "
                         f"No records match exactly."), 0
+            # else: no match and no date — fall back to kNN below
 
         # 2) Full-database terms aggregation when the question asks to enumerate
         # a recognized field type (locations, equipment, radars, ...).
