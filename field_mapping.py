@@ -67,3 +67,12 @@ TYPE_MAPPING = {
         "field_labels": ["Description", "Visit Name", "Purpose", "Location Name", "Coordinates"],
     }
 }
+
+# Free-text analyst commentary fields present across many document types.
+# Appended to every type so any doc carrying them gets them embedded — the
+# per-field embedding skips docs where a field is absent, so this is safe.
+for _tm in TYPE_MAPPING.values():
+    for _f, _l in (("comment", "Comments"), ("comments", "Additional Comments")):
+        if _f not in _tm["fields"]:
+            _tm["fields"].append(_f)
+            _tm["field_labels"].append(_l)
