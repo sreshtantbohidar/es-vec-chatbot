@@ -60,14 +60,19 @@ for _mapping in TYPE_MAPPING.values():
 
 def _to_embed_text(field_name, val):
     """Convert a field value to a clean string suitable for embedding.
-    
+
     - Lists (e.g. coordinates [lat, lng]) → "lat, lng"
     - Numbers → str(val)
     - Strings → stripped str(val)
+    Junk values (na/none/null/test/n/a/-) are treated as empty.
     """
     if isinstance(val, list):
-        return ", ".join(str(v) for v in val)
-    return str(val).strip()
+        text = ", ".join(str(v) for v in val)
+    else:
+        text = str(val).strip()
+    if text.lower() in ("na", "n/a", "none", "null", "nil", "test", "-", "--"):
+        return ""
+    return text
 
 VECTOR_FIELD_PREFIX = "vec_"
 
