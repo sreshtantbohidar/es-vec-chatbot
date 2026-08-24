@@ -1,8 +1,17 @@
 import os
+import time
+import random
+import threading
+import numpy as np
 import requests
 from flask import Flask, request, jsonify, render_template_string, session
 from elasticsearch import Elasticsearch
 from field_mapping import TYPE_MAPPING
+
+try:
+    from flask_session import Session
+except ImportError:
+    Session = None  # fall back to cookie sessions if flask-session is missing
 
 
 def load_env_file(path=".env"):
@@ -28,7 +37,19 @@ load_env_file()
 
 # Initialize Flask App
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "super_secret_infinite_memory_key")
+_secret = os.getenv("FLASK_SECRET_KEY")
+if not _secret:
+    # Cookie/server sessions are forgeable without a real secret — refuse to guess.
+    raise RuntimeError("FLASK_SECRET_KEY is not set. Add it to .env (e.g. `python -c \"import secrets; print(secrets.token_hex(32))\"`).")
+app.secret_key = _secret
+
+# Server-side sessions: Flask's default cookie session caps at ~4KB, which RAG
+# responses blow through silently. Filesystem sessions have no such limit.
+if Session is not None:
+    app.config["SESSION_TYPE"] = "filesystem"
+    app.config["SESSION_FILE_DIR"] = os.getenv("SESSION_FILE_DIR", os.path.join(os.path.dirname(__file__), ".flask_sessions"))
+    os.makedirs(app.config["SESSION_FILE_DIR"], exist_ok=True)
+    Session(app)
 
 # Configuration Constants (connection details from .env)
 ES_URL = os.getenv("ES_HOST", "http://localhost:9200")
@@ -61,14 +82,22 @@ except Exception as e:
     print(f"Elasticsearch Initialization Error: {e}")
 
 def _embed_one(text, max_retries=3):
-    """Single Ollama embedding call with retry."""
+    """Single Ollama embedding call with retry on transient errors only."""
     url = OLLAMA_BASE_URL + "/api/embeddings"
     payload = {"model": EMBED_MODEL, "prompt": text}
-    import time
+    response = None
     for attempt in range(max_retries):
-        response = requests.post(url, json=payload, timeout=120)
-        if response.status_code == 200:
-            return response.json()["embedding"]
+        try:
+            response = requests.post(url, json=payload, timeout=120)
+            if response.status_code == 200:
+                return response.json()["embedding"]
+            # 400/404 are deterministic (bad model/payload) — don't waste time retrying
+            if response.status_code < 500:
+                break
+        except requests.RequestException as e:
+            # Network errors are transient — retry
+            if attempt >= max_retries - 1:
+                raise RuntimeError(f"Ollama embedding network error: {e}")
         if attempt < max_retries - 1:
             time.sleep(2 ** attempt)
     raise RuntimeError(f"Ollama embedding error {response.status_code}: {response.text}")
@@ -90,7 +119,6 @@ def get_embedding(text, chunk_size=7500):
             chunks.append(text[start:start + chunk_size])
             start += chunk_size - overlap
 
-        import numpy as np
         vectors = [_embed_one(chunk) for chunk in chunks]
         return np.mean(vectors, axis=0).tolist()
     except Exception as e:
@@ -181,22 +209,47 @@ def compress_history(summary_so_far, old_turns):
     return query_ollama(prompt)
 
 
+# Pending chat summaries computed by background compression threads,
+# keyed by a per-session id. Applied at the start of the next request.
+_pending_summaries = {}
+_summaries_lock = threading.Lock()
+
+
+def _compress_in_background(session_id, summary_so_far, old_turns):
+    try:
+        updated = compress_history(summary_so_far, old_turns)
+        if updated and not updated.startswith("Error"):
+            with _summaries_lock:
+                _pending_summaries[session_id] = updated
+    except Exception as e:
+        print(f"Background compression failed: {e}")
+
+
 def manage_memory():
     """Maintains a rolling summary and purges raw logs exceeding threshold."""
     if 'history' not in session:
         session['history'] = []
     if 'chat_summary' not in session:
         session['chat_summary'] = ""
+    if 'session_id' not in session:
+        session['session_id'] = os.urandom(16).hex()
 
-    # Threshold: If raw turns exceed 4 messages (2 exchanges), compress the oldest 2
-    if len(session['history']) > 4:
-        turns_to_compress = session['history'][:2]
-        # Keep the rest in active memory
-        session['history'] = session['history'][2:]
-        
-        # Run background summarization block
-        updated_summary = compress_history(session['chat_summary'], turns_to_compress)
-        session['chat_summary'] = updated_summary
+    # Apply any summary produced by an earlier background compression
+    with _summaries_lock:
+        pending = _pending_summaries.pop(session['session_id'], None)
+    if pending:
+        session['chat_summary'] = pending
+
+    # Compress the oldest turns once raw history grows past 8 messages.
+    # Runs in a background thread so it doesn't add latency to this response.
+    if len(session['history']) > 8:
+        turns_to_compress = session['history'][:4]
+        session['history'] = session['history'][4:]
+        threading.Thread(
+            target=_compress_in_background,
+            args=(session['session_id'], session['chat_summary'], turns_to_compress),
+            daemon=True,
+        ).start()
 
 
 @app.route("/", methods=["GET"])
@@ -208,7 +261,7 @@ def index():
 @app.route("/chat", methods=["POST"])
 def chat():
     """Main RAG Chat Pipeline with Infinite Memory Handling."""
-    user_message = request.json.get("message", "").strip()
+    user_message = (request.get_json(silent=True) or {}).get("message", "").strip()
     if not user_message:
         return jsonify({"response": "Please enter a valid message."}), 400
 
@@ -299,10 +352,13 @@ Answer based on the documents above:"""
 
     # 5. Query Ollama and Update Live Session Logs
     bot_response = query_ollama(system_prompt)
-    
+    if bot_response == "Error communicating with local LLM layer.":
+        # Don't persist failed responses into conversation memory
+        return jsonify({"response": bot_response}), 503
+
     session['history'].append({"role": "user", "content": user_message})
     session['history'].append({"role": "assistant", "content": bot_response})
-    session.modified = True  # Explicitly save changes to the session storage cookie
+    session.modified = True  # Explicitly save changes to the session storage
 
     return jsonify({
         "response": bot_response,
@@ -394,4 +450,4 @@ HTML_TEMPLATE = """
 """
 
 if __name__ == "__main__":
-    app.run(host=APP_HOST, port=APP_PORT, debug=True)
+    app.run(host=APP_HOST, port=APP_PORT, debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")

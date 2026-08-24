@@ -36,6 +36,12 @@ ES_USER = os.getenv("ES_USER")
 ES_PASS = os.getenv("ES_PASS")
 ES_VERIFY_CERTS = os.getenv("ES_VERIFY_CERTS", "false").lower() == "true"
 EMBED_MODEL = os.getenv("EMBED_MODEL") or "nomic-embed-text"
+# Number of field texts sent in a single /api/embed request (Ollama supports batching)
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", "32"))
+# Worker threads for the fallback parallel path (used when /api/embed is unavailable)
+EMBED_WORKERS = int(os.getenv("EMBED_WORKERS", "8"))
+# Docs accumulated before a bulk flush to Elasticsearch
+BATCH_SIZE = int(os.getenv("MIGRATE_BATCH_SIZE", "20"))
 EMBED_DIMS = int(os.getenv("EMBED_DIMS", "768"))
 OLLAMA_BASE_URL = (os.getenv("OLLAMA_URL") or os.getenv("LLM_BASE_URL") or "http://localhost:11434").rstrip("/")
 SOURCE_INDEX = "fatboy_data"
@@ -111,12 +117,56 @@ def _embed_one(text, max_retries=3):
     return last_response.json()["embedding"]
 
 
-def get_embedding(text):
-    """Generate embedding via Ollama's /api/embeddings endpoint.
+def _embed_batch_api(texts, max_retries=3):
+    """Embed a list of texts in ONE request via Ollama's /api/embed endpoint.
 
-    Individual field values are short enough to fit nomic-embed-text's
-    context window, so no chunking is needed here.
+    Returns a list of embeddings. Raises on final failure so the caller can
+    fall back to per-text embedding.
     """
+    url = OLLAMA_BASE_URL + "/api/embed"
+    payload = {"model": EMBED_MODEL, "input": texts}
+    last_response = None
+    for attempt in range(max_retries):
+        response = requests.post(url, json=payload, timeout=300)
+        if response.status_code == 200:
+            data = response.json()
+            embeddings = data.get("embeddings")
+            if embeddings and len(embeddings) == len(texts):
+                return embeddings
+            raise ValueError(f"/api/embed returned {len(embeddings or [])} vectors for {len(texts)} inputs")
+        last_response = response
+        if response.status_code in (500, 502, 503, 504) and attempt < max_retries - 1:
+            wait = 2 ** attempt
+            print(f"    Retry {attempt+1}/{max_retries} (status {response.status_code}), waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        break
+    last_response.raise_for_status()
+
+
+def _safe_embed(text):
+    """Return (True, embedding) or (False, None) instead of raising."""
+    try:
+        return True, _embed_one(text)
+    except Exception:
+        return False, None
+
+
+def get_embeddings_batch(texts):
+    """Embed multiple texts, preferring the batch endpoint with a threaded fallback."""
+    if not texts:
+        return []
+    try:
+        return _embed_batch_api(texts)
+    except Exception as e:
+        print(f"    [BATCH FALLBACK] {e}; using {EMBED_WORKERS} parallel workers")
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=EMBED_WORKERS) as pool:
+            return list(pool.map(_embed_one, texts))
+
+
+def get_embedding(text):
+    """Generate a single embedding via Ollama (used by the fallback path)."""
     return _embed_one(text)
 
 
@@ -212,7 +262,7 @@ def migrate_and_vectorize(max_docs=None):
     if not OLLAMA_BASE_URL:
         print("\n  FATAL: Ollama URL is empty! Set OLLAMA_URL or LLM_BASE_URL in .env.")
         sys.exit(1)
-    print(f"  Batch size:          50 docs")
+    print(f"  Batch size:          {batch_size} docs")
     print(f"  Retry attempts:      3 (exponential backoff)")
     est = (effective_total * total_fields) if effective_total else "unknown"
     print(f"  Est. embed calls:    {est}")
@@ -223,7 +273,7 @@ def migrate_and_vectorize(max_docs=None):
     scan_iterator = helpers.scan(es, query=query, index=SOURCE_INDEX, scroll="5m", size=100)
 
     batch = []
-    batch_size = 20
+    batch_size = BATCH_SIZE
     total_indexed = 0
     total_embed_calls = 0
     total_empty_fields = 0
@@ -244,26 +294,47 @@ def migrate_and_vectorize(max_docs=None):
         fields_empty = 0
         fields_failed = 0
 
-        # Embed each field separately
+        # Embed all non-empty fields in ONE batched request
+        embed_jobs = []  # (vec_field_name, field)
         for field, label in FIELD_LABEL_PAIRS:
             vec_field_name = VECTOR_FIELD_PREFIX + field
             val = source_data.get(field)
-            if val and str(val).strip():
-                try:
-                    embed_text = _to_embed_text(field, val)
-                    embedding = get_embedding(embed_text)
-                    source_data[vec_field_name] = embedding
+            if val is not None and str(val).strip():
+                embed_jobs.append((vec_field_name, field))
+
+        if embed_jobs:
+            texts = [_to_embed_text(f, source_data.get(f)) for _, f in embed_jobs]
+            try:
+                embeddings = get_embeddings_batch(texts)
+                for (vec_field_name, _), emb in zip(embed_jobs, embeddings):
+                    source_data[vec_field_name] = emb
                     total_embed_calls += 1
                     fields_embedded += 1
-                except Exception as e:
-                    print(f"  [ERROR] doc {doc_id[:12]}.. field='{field}': {e}")
-                    source_data[vec_field_name] = _zero_vector()
-                    fields_failed += 1
-                    total_errors += 1
-                time.sleep(0.1)
-            else:
+            except Exception as e:
+                print(f"  [ERROR] doc {doc_id[:12]}.. batch embed failed: {e}")
+                # Embed fields individually so one bad field doesn't kill the doc
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=EMBED_WORKERS) as pool:
+                    results = list(pool.map(
+                        lambda t: _safe_embed(t[1]),
+                        enumerate(texts),
+                    ))
+                for (vec_field_name, field), ok, emb in zip(embed_jobs, [r[0] for r in results], [r[1] for r in results]):
+                    if ok:
+                        source_data[vec_field_name] = emb
+                        total_embed_calls += 1
+                        fields_embedded += 1
+                    else:
+                        source_data[vec_field_name] = _zero_vector()
+                        fields_failed += 1
+                        total_errors += 1
+                print(f"    recovered {fields_embedded}/{len(embed_jobs)} fields individually")
+
+        fields_empty = len(FIELD_LABEL_PAIRS) - fields_embedded - fields_failed
+        for field, label in FIELD_LABEL_PAIRS:
+            vec_field_name = VECTOR_FIELD_PREFIX + field
+            if vec_field_name not in source_data:
                 source_data[vec_field_name] = _zero_vector()
-                fields_empty += 1
                 total_empty_fields += 1
 
         # Build combined_text for readability
