@@ -266,7 +266,7 @@ def manage_memory():
 @app.route("/", methods=["GET"])
 def index():
     """Render a lightweight UI layout for local testing."""
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML_TEMPLATE, build_version=GIT_VERSION)
 
 
 # Keywords that signal an aggregation/listing question ("show me all locations",
@@ -823,6 +823,23 @@ def _retrieve_context(user_message, query_vector, debug=None):
         return "No relevant context found in index.", 0
 
 
+# Build version shown in the UI header (short git SHA) so stale instances are obvious.
+def _git_version():
+    try:
+        import subprocess
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=5,
+                             cwd=os.path.dirname(os.path.abspath(__file__)))
+        if sha.returncode == 0:
+            return sha.stdout.strip()
+    except Exception:
+        pass
+    return "dev"
+
+
+GIT_VERSION = _git_version()
+
+
 def _hit_record(hit):
     """Flatten one ES hit into {id, score, fields{}} for UI display."""
     src = hit.get("_source", {})
@@ -1176,7 +1193,7 @@ HTML_TEMPLATE = r"""
         <div class="chat-header">
             <div>
                 <div class="title">🛰 Tectum RAG Chatbot</div>
-                <div class="subtitle">Elasticsearch vector search + LLM</div>
+                <div class="subtitle">Elasticsearch vector search + LLM · build {{ build_version }}</div>
             </div>
             <button class="clear-btn" onclick="clearChat()">Clear Memory</button>
         </div>
