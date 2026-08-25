@@ -4,7 +4,7 @@ import time
 import random
 import threading
 import numpy as np
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import requests
 from flask import Flask, request, jsonify, render_template_string, session
 from elasticsearch import Elasticsearch
@@ -400,6 +400,67 @@ _MONTH_NAMES = ("january", "february", "march", "april", "may", "june", "july",
 _YEAR_RE = re.compile(r"\b(20\d{2})\b")
 _JUNK_LOCATIONS = {"unknown", "location not known", "na", "none"}
 
+# Filler words ignored when extracting keyword-search terms from a question.
+_STOPWORD_TERMS = {
+    "the", "and", "with", "mention", "give", "you", "have", "from",
+    "about", "what", "which", "when", "where", "how", "latest",
+    "information", "records", "data", "show", "list", "please",
+}
+
+# Relative date ranges: "current/this month", "last month", "last 6 months",
+# "past 30 days", "this year", "last year". Resolved against today's date.
+_RELATIVE_RANGE_RES = (
+    (re.compile(r"\b(?:current|this)\s+month\b"), "cur_month"),
+    (re.compile(r"\blast\s+month\b|\bprevious\s+month\b"), "prev_month"),
+    (re.compile(r"\b(?:last|past|previous|previous\s+\d+|prior)\s+(\d+)\s*months?\b"
+                r"|\b(?:last|past)\s+(\d+)\s*months?\b"), "n_months"),
+    (re.compile(r"\b(?:last|past)\s+(\d+)\s*days?\b"), "n_days"),
+    (re.compile(r"\b(?:current|this)\s+year\b"), "cur_year"),
+    (re.compile(r"\blast\s+year\b|\bprevious\s+year\b"), "prev_year"),
+)
+
+
+def _resolve_relative_range(message):
+    """Return {gte, lte} ISO dates for a relative range mentioned in the
+    message ("last 6 months", "current month", ...), or None."""
+    lowered = message.lower()
+    today = datetime.now().date()
+    import calendar as _cal
+
+    def month_bounds(y, m):
+        return (date(y, m, 1).isoformat(),
+                date(y, m, _cal.monthrange(y, m)[1]).isoformat())
+
+    for rx, kind in _RELATIVE_RANGE_RES:
+        m = rx.search(lowered)
+        if not m:
+            continue
+        if kind == "cur_month":
+            gte, lte = month_bounds(today.year, today.month)
+            return {"gte": gte, "lte": lte}
+        if kind == "prev_month":
+            first = (today.replace(day=1) - timedelta(days=1))
+            gte, lte = month_bounds(first.year, first.month)
+            return {"gte": gte, "lte": lte}
+        if kind == "n_months":
+            n = int(m.group(1) or m.group(2) or 6)
+            # Rolling window ending today: [today - n months + 1 day, today]
+            anchor = today.replace(day=1)
+            y, mo = anchor.year, anchor.month
+            for _ in range(n):
+                mo -= 1
+                if mo == 0:
+                    mo, y = 12, y - 1
+            return {"gte": date(y, mo, anchor.day).isoformat(), "lte": today.isoformat()}
+        if kind == "n_days":
+            n = int(m.group(1))
+            return {"gte": (today - timedelta(days=n)).isoformat(), "lte": today.isoformat()}
+        if kind == "cur_year":
+            return {"gte": f"{today.year}-01-01", "lte": f"{today.year}-12-31"}
+        if kind == "prev_year":
+            return {"gte": f"{today.year-1}-01-01", "lte": f"{today.year-1}-12-31"}
+    return None
+
 
 def _extract_entities(message):
     """Pull locations, exact dates, and month/year ranges from the message."""
@@ -553,6 +614,23 @@ def _retrieve_context(user_message, query_vector):
             if dhits:
                 hits = dhits
 
+        if hits is None:
+            rel_range = _resolve_relative_range(user_message)
+            if rel_range:
+                try:
+                    res = es.search(index=ES_INDEX, body={
+                        "query": {"bool": {
+                            "must": [{"exists": {"field": "activity_date"}}],
+                            "filter": [{"range": {"activity_date": rel_range}}],
+                        }},
+                        "size": 30, "sort": [{"activity_date": {"order": "desc"}}],
+                    })
+                    rhits = res.get("hits", {}).get("hits", [])
+                    if rhits:
+                        hits = rhits
+                except Exception as e:
+                    print(f"Relative range search exception: {e}")
+
         # 1b) Near-date fallback: when a location matched but the exact day
         # didn't, surface the closest dated records instead of nothing.
         if hits is None and resolved:
@@ -597,6 +675,31 @@ def _retrieve_context(user_message, query_vector):
                 ]
                 res = es.search(index=ES_INDEX, body={"knn": knn_queries, "_source": True})
                 hits = res.get("hits", {}).get("hits", [])
+
+                # Keyword fallback: kNN is semantic and can miss exact token
+                # mentions ("with mention of grenade"). If no top-kNN doc
+                # actually contains the message's salient keywords, run a
+                # plain match on combined_text and prefer its hits.
+                _kw_terms = [w for w in re.findall(r"[a-z][a-z\-]{2,}", user_message.lower())
+                             if w not in _STOPWORD_TERMS]
+                if _kw_terms:
+                    try:
+                        kw_res = es.search(index=ES_INDEX, body={
+                            "query": {"bool": {"should": [
+                                {"match": {"combined_text": t}} for t in _kw_terms[:5]
+                            ], "minimum_should_match": 1}},
+                            "size": 10,
+                        })
+                        khits = kw_res.get("hits", {}).get("hits", [])
+                        # Only override when a keyword hit scores well AND the
+                        # top kNN docs don't already contain those keywords.
+                        if khits:
+                            kw_ids = {h["_id"] for h in khits}
+                            knn_has_kw = any(h["_id"] in kw_ids for h in hits)
+                            if not knn_has_kw and (khits[0].get("_score") or 0) >= 5.0:
+                                hits = khits
+                    except Exception as e:
+                        print(f"Keyword fallback exception: {e}")
 
         # Deduplicate by stable doc _id
         seen_ids = set()
@@ -666,7 +769,8 @@ INSTRUCTIONS:
 - If the documents don't contain enough information, say so honestly.
 - When asked how many records the DATABASE has, use "Total records in database" ({total_docs}), NOT the number of documents provided. The provided documents are only a sample relevant to the question.
 - When asked to list or show all of something (e.g. all locations), enumerate every distinct value across ALL provided documents, not just the first few.
-- If a section labeled "FULL DATABASE AGGREGATION" is present, it contains exact distinct values and record counts computed over the ENTIRE database — present them completely (grouped/summarized if very long) and do not caveat that it may be incomplete.
+- If a section labeled "FULL DATABASE AGGREGATION" is present, it contains exact distinct values and record counts computed over the ENTIRE database. This data IS complete and exhaustive — enumerate the values in your answer (grouped/summarized ONLY if there are more than ~30) and NEVER say it may be incomplete, non-exhaustive, or a sample.
+- When you present values from a FULL DATABASE AGGREGATION, do not add disclaimers like "this is not an exhaustive list". The aggregation scanned every record in the database.
 - When referencing a document to the user, cite it as its stable id shown in parentheses, e.g. "document (id: abc123)".
 - When listing data, use the actual values from the documents.
 - Format your response clearly with bullet points or tables when presenting multiple records.
@@ -707,55 +811,254 @@ def clear_session():
     return jsonify({"status": "Session wiped successfully."})
 
 
-# Embedded Minimal HTML Template
-HTML_TEMPLATE = """
+# Embedded Chat UI Template
+# Markdown rendering: tries marked + DOMPurify from CDN; falls back to a tiny
+# built-in renderer (bold / italics / code / bullets / tables) when offline.
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Infinite Memory ES Chatbot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Tectum RAG Chatbot</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
     <style>
-        body { font-family: Arial, sans-serif; background: #f4f6f9; margin: 0; padding: 20px; }
-        .chat-container { max-width: 700px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); overflow: hidden; display: flex; flex-direction: column; height: 80vh; }
-        .chat-header { background: #007bff; color: white; padding: 15px; font-weight: bold; display: flex; justify-content: space-between; align-items: center;}
-        .chat-box { flex: 1; padding: 20px; overflow-y: auto; border-bottom: 1px solid #eee; }
-        .message { margin-bottom: 15px; padding: 10px 15px; border-radius: 6px; max-width: 80%; }
-        .user { background: #e1ffc7; align-self: flex-end; margin-left: auto; }
-        .bot { background: #f1f0f0; align-self: flex-start; }
-        .msg-meta { display: block; font-size: 11px; color: #888; margin-top: 4px; }
-        .input-area { display: flex; padding: 15px; background: #fafafa; }
-        input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
-        button { background: #007bff; color: white; border: none; padding: 10px 20px; margin-left: 10px; border-radius: 4px; cursor: pointer; }
-        .clear-btn { background: #dc3545; font-size: 12px; padding: 5px 10px; }
+        :root {
+            --bg: #eef1f6;
+            --panel: #ffffff;
+            --header: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%);
+            --accent: #2563eb;
+            --user-bubble: linear-gradient(135deg, #2563eb, #3b82f6);
+            --bot-bubble: #f4f6fa;
+            --text: #1f2937;
+            --muted: #6b7280;
+            --border: #e5e7eb;
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: var(--bg);
+            margin: 0; padding: 20px;
+            display: flex; justify-content: center; align-items: center;
+            min-height: calc(100vh - 40px);
+        }
+        .chat-container {
+            max-width: 820px; width: 100%; height: 85vh;
+            background: var(--panel); border-radius: 16px;
+            box-shadow: 0 10px 30px rgba(15, 23, 42, .12);
+            display: flex; flex-direction: column; overflow: hidden;
+        }
+        .chat-header {
+            background: var(--header); color: white; padding: 16px 20px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .chat-header .title { font-size: 17px; font-weight: 700; letter-spacing: .2px; }
+        .chat-header .subtitle { font-size: 12px; opacity: .85; margin-top: 2px; }
+        .clear-btn {
+            background: rgba(255,255,255,.18); color: white; border: 1px solid rgba(255,255,255,.35);
+            padding: 6px 14px; border-radius: 999px; cursor: pointer; font-size: 12px;
+            transition: background .2s;
+        }
+        .clear-btn:hover { background: rgba(255,255,255,.32); }
+
+        .chat-box { flex: 1; overflow-y: auto; padding: 24px; scroll-behavior: smooth; }
+
+        .row { display: flex; gap: 10px; margin-bottom: 18px; align-items: flex-start; }
+        .row.user { flex-direction: row-reverse; }
+        .avatar {
+            width: 34px; height: 34px; border-radius: 50%; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 15px; color: white; user-select: none;
+        }
+        .row.bot .avatar { background: var(--accent); }
+        .row.user .avatar { background: #059669; }
+        .bubble-wrap { max-width: 82%; display: flex; flex-direction: column; }
+        .row.user .bubble-wrap { align-items: flex-end; }
+        .message {
+            padding: 12px 16px; border-radius: 14px; line-height: 1.55;
+            font-size: 14.5px; color: var(--text); word-break: break-word;
+        }
+        .message.bot { background: var(--bot-bubble); border: 1px solid var(--border); border-top-left-radius: 4px; }
+        .message.user { background: var(--user-bubble); color: white; border-top-right-radius: 4px; }
+        .msg-meta { font-size: 11px; color: var(--muted); margin-top: 5px; padding: 0 4px; }
+
+        /* Markdown content styling */
+        .message.bot h1, .message.bot h2, .message.bot h3,
+        .message.bot h4, .message.bot h5 { margin: 14px 0 8px; color: #111827; line-height: 1.3; }
+        .message.bot h1 { font-size: 19px; } .message.bot h2 { font-size: 17px; } .message.bot h3 { font-size: 15px; }
+        .message.bot p { margin: 8px 0; }
+        .message.bot p:first-child { margin-top: 0; }
+        .message.bot p:last-child { margin-bottom: 0; }
+        .message.bot ul, .message.bot ol { margin: 8px 0; padding-left: 22px; }
+        .message.bot li { margin: 4px 0; }
+        .message.bot li::marker { color: var(--accent); font-weight: bold; }
+        .message.bot strong { color: #111827; }
+        .message.bot code {
+            background: #e8edf5; padding: 1px 5px; border-radius: 4px;
+            font-family: Consolas, monospace; font-size: 13px; color: #b91c1c;
+        }
+        .message.bot pre {
+            background: #0f172a; color: #e2e8f0; padding: 12px 14px;
+            border-radius: 8px; overflow-x: auto; margin: 10px 0;
+        }
+        .message.bot pre code { background: none; color: inherit; padding: 0; }
+        .message.bot blockquote {
+            margin: 8px 0; padding: 6px 14px; border-left: 3px solid var(--accent);
+            background: #eff6ff; border-radius: 0 6px 6px 0; color: #374151;
+        }
+        .message.bot hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+        .message.bot table {
+            border-collapse: collapse; margin: 10px 0; width: 100%;
+            font-size: 13.5px; display: block; overflow-x: auto;
+        }
+        .message.bot th, .message.bot td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+        .message.bot th { background: #eff6ff; color: #1e3a8a; font-weight: 600; }
+        .message.bot tr:nth-child(even) td { background: #f9fafb; }
+
+        /* Typing indicator */
+        .typing { display: inline-flex; gap: 5px; padding: 4px 2px; }
+        .typing span {
+            width: 8px; height: 8px; border-radius: 50%; background: #94a3b8;
+            animation: bounce 1.2s infinite ease-in-out;
+        }
+        .typing span:nth-child(2) { animation-delay: .15s; }
+        .typing span:nth-child(3) { animation-delay: .3s; }
+        @keyframes bounce { 0%,60%,100% { transform: translateY(0); opacity:.5;} 30% { transform: translateY(-5px); opacity:1;} }
+
+        .input-area {
+            display: flex; gap: 10px; padding: 14px 18px; background: #fafbfd;
+            border-top: 1px solid var(--border);
+        }
+        input {
+            flex: 1; padding: 12px 16px; border: 1.5px solid var(--border);
+            border-radius: 999px; font-size: 14px; outline: none; transition: border-color .2s;
+        }
+        input:focus { border-color: var(--accent); }
+        .send-btn {
+            background: var(--user-bubble); color: white; border: none;
+            padding: 0 24px; border-radius: 999px; cursor: pointer; font-size: 14px; font-weight: 600;
+            transition: transform .15s, box-shadow .15s;
+        }
+        .send-btn:hover { box-shadow: 0 4px 12px rgba(37, 99, 235, .35); transform: translateY(-1px); }
+        .send-btn:disabled { opacity: .6; cursor: wait; transform: none; box-shadow: none; }
     </style>
 </head>
 <body>
     <div class="chat-container">
         <div class="chat-header">
-            <span>Tectum RAG Chatbot (ES + Ollama)</span>
+            <div>
+                <div class="title">🛰 Tectum RAG Chatbot</div>
+                <div class="subtitle">Elasticsearch vector search + LLM</div>
+            </div>
             <button class="clear-btn" onclick="clearChat()">Clear Memory</button>
         </div>
-        <div class="chat-box" id="chatBox">
-            <div class="message bot">Hello! Ask me anything regarding your indexed documents.</div>
-        </div>
+        <div class="chat-box" id="chatBox"></div>
         <div class="input-area">
-            <input type="text" id="userInput" placeholder="Type your message here..." onkeypress="handleKey(event)">
-            <button onclick="sendMessage()">Send</button>
+            <input type="text" id="userInput" placeholder="Ask about your indexed documents…" onkeypress="handleKey(event)" autocomplete="off">
+            <button class="send-btn" id="sendBtn" onclick="sendMessage()">Send</button>
         </div>
     </div>
 
     <script>
+        const chatBox = document.getElementById('chatBox');
+        const sendBtn = document.getElementById('sendBtn');
+        const userInput = document.getElementById('userInput');
+
+        function escapeHtml(text) {
+            return text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
+        // Render LLM markdown to safe HTML.
+        // Primary path: marked + DOMPurify from CDN. Fallback: minimal renderer
+        // (headings, bold, italics, code, lists, tables, paragraphs) for offline use.
+        function renderMarkdown(text) {
+            if (window.marked && window.DOMPurify) {
+                return DOMPurify.sanitize(marked.parse(text));
+            }
+            let html = escapeHtml(text);
+            html = html.replace(/^###### (.*)$/gm, '<h5>$1</h5>')
+                       .replace(/^##### (.*)$/gm, '<h5>$1</h5>')
+                       .replace(/^#### (.*)$/gm, '<h4>$1</h4>')
+                       .replace(/^### (.*)$/gm, '<h3>$1</h3>')
+                       .replace(/^## (.*)$/gm, '<h2>$1</h2>')
+                       .replace(/^# (.*)$/gm, '<h1>$1</h1>');
+            html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+                       .replace(/(^|\\W)\\*([^*\\n]+)\\*(?=\\W|$)/g, '$1<em>$2</em>')
+                       .replace(/`([^`]+)`/g, '<code>$1</code>');
+            // bullet lists
+            html = html.replace(/(?:^|\\n)((?:[ \\t]*[-*•][^\\n]*(?:\\n|$))+)/g, function(m, block){
+                const items = block.trim().split('\\n').map(l =>
+                    '<li>' + l.replace(/^[ \\t]*[-*•][ \\t]*/, '') + '</li>').join('');
+                return '\\n<ul>' + items + '</ul>\\n';
+            });
+            // simple pipe tables
+            html = html.replace(/(?:^|\\n)(\\|.+\\|)(?:\\n\\|[ :-]+\\|)((?:\\n\\|.+\\|)+)/g, function(m, head, rows){
+                const cells = r => r.split('|').slice(1, -1).map(c => c.trim());
+                const th = cells(head).map(c => '<th>'+c+'</th>').join('');
+                const trs = rows.trim().split('\\n').map(r =>
+                    '<tr>' + cells(r).map(c => '<td>'+c+'</td>').join('') + '</tr>').join('');
+                return '\\n<table><thead><tr>'+th+'</tr></thead><tbody>'+trs+'</tbody></table>\\n';
+            });
+            html = html.replace(/\\n{2,}/g, '</p><p>').replace(/\\n/g, '<br>');
+            return '<p>' + html + '</p>';
+        }
+
         function nowTime() {
             return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         }
+
+        function addRow(sender) {
+            const row = document.createElement('div');
+            row.className = 'row ' + sender;
+            const avatar = document.createElement('div');
+            avatar.className = 'avatar';
+            avatar.textContent = sender === 'user' ? '🧑' : '🤖';
+            const wrap = document.createElement('div');
+            wrap.className = 'bubble-wrap';
+            const bubble = document.createElement('div');
+            bubble.className = 'message ' + sender;
+            wrap.appendChild(bubble);
+            row.appendChild(avatar);
+            row.appendChild(wrap);
+            chatBox.appendChild(row);
+            return { row, wrap, bubble };
+        }
+
+        function appendMessage(text, sender, elapsedSeconds, asMarkdown) {
+            const { wrap, bubble } = addRow(sender);
+            if (sender === 'user') {
+                bubble.textContent = text;
+            } else if (asMarkdown === false) {
+                bubble.textContent = text;
+            } else {
+                bubble.innerHTML = renderMarkdown(text);
+            }
+            const meta = document.createElement('span');
+            meta.className = 'msg-meta';
+            let label = nowTime();
+            if (sender === 'bot' && elapsedSeconds) label += ' · ' + elapsedSeconds + 's';
+            meta.innerText = label;
+            wrap.appendChild(meta);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        function showTyping() {
+            const { row, wrap, bubble } = addRow('bot');
+            bubble.innerHTML = '<span class="typing"><span></span><span></span><span></span></span>';
+            chatBox.scrollTop = chatBox.scrollHeight;
+            return row;
+        }
+
         async function sendMessage() {
-            const input = document.getElementById('userInput');
-            const message = input.value.trim();
-            if(!message) return;
+            const message = userInput.value.trim();
+            if (!message || sendBtn.disabled) return;
 
             appendMessage(message, 'user');
-            input.value = '';
+            userInput.value = '';
+            sendBtn.disabled = true;
             const startedAt = Date.now();
+            const typingRow = showTyping();
 
             try {
                 const res = await fetch('/chat', {
@@ -763,37 +1066,34 @@ HTML_TEMPLATE = """
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ message })
                 });
+                typingRow.remove();
                 if (res.status === 503) {
-                    appendMessage('The LLM backend is not responding. Please try again.', 'bot', 0);
+                    appendMessage('⚠️ The LLM backend is not responding. Please try again.', 'bot', 0, false);
                     return;
                 }
                 const data = await res.json();
-                // Prefer server-measured time (retrieval + LLM); fall back to client-side
                 const elapsed = data.elapsed_seconds || ((Date.now() - startedAt) / 1000).toFixed(1);
                 appendMessage(data.response, 'bot', elapsed);
             } catch(e) {
-                appendMessage('Failed to get a response.', 'bot', 0);
+                typingRow.remove();
+                appendMessage('⚠️ Failed to get a response.', 'bot', 0, false);
+            } finally {
+                sendBtn.disabled = false;
+                userInput.focus();
             }
         }
-        function handleKey(e) { if(e.key === 'Enter') sendMessage(); }
-        function appendMessage(text, sender, elapsedSeconds) {
-            const box = document.getElementById('chatBox');
-            const div = document.createElement('div');
-            div.className = `message ${sender}`;
-            div.innerText = text;
-            const meta = document.createElement('span');
-            meta.className = 'msg-meta';
-            let label = nowTime();
-            if (sender === 'bot' && elapsedSeconds) label += ` · ${elapsedSeconds}s`;
-            meta.innerText = label;
-            div.appendChild(meta);
-            box.appendChild(div);
-            box.scrollTop = box.scrollHeight;
-        }
+
+        function handleKey(e) { if (e.key === 'Enter') sendMessage(); }
+
         async function clearChat() {
             await fetch('/clear', { method: 'POST' });
-            document.getElementById('chatBox').innerHTML = '<div class="message bot">Memory cleared! How can I help you now?</div>';
+            chatBox.innerHTML = '';
+            appendMessage('Memory cleared! How can I help you now?', 'bot', 0, false);
         }
+
+        // Greeting
+        appendMessage('Hello! 👋 Ask me anything regarding your indexed documents.', 'bot', 0, false);
+        userInput.focus();
     </script>
 </body>
 </html>
