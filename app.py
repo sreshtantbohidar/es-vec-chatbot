@@ -1112,7 +1112,11 @@ HTML_TEMPLATE = r"""
         }
         .records-table td {
             border: 1px solid var(--border); padding: 7px 10px; vertical-align: top;
-            max-width: 240px; word-break: break-word;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+            max-width: 260px; cursor: pointer;
+        }
+        .records-table td.expanded {
+            white-space: normal; overflow: visible; text-overflow: clip; cursor: default;
         }
         .records-table tr:nth-child(even) td { background: #f9fafb; }
         .rec-id { font-family: Consolas, monospace; font-size: 11px; color: #6d28d9; white-space: nowrap; }
@@ -1358,7 +1362,9 @@ HTML_TEMPLATE = r"""
                         '<td>' + r.score + '</td>' +
                         allFields.map(f => {
                             const v = r.fields[f];
-                            return '<td>' + (v === undefined ? '' : escapeHtml(fmtVal(v))) + '</td>';
+                            if (v === undefined) return '<td></td>';
+                            const full = escapeHtml(fmtVal(v));
+                            return '<td class="cell-clamp" title="Click to expand">' + full + '</td>';
                         }).join('') + '</tr>';
             });
             html += '</tbody></table>';
@@ -1383,6 +1389,10 @@ HTML_TEMPLATE = r"""
             if (next) next.onclick = () => { recordsPage++; renderTab(); };
             document.querySelectorAll('.pg-num').forEach(b => {
                 b.onclick = () => { recordsPage = parseInt(b.dataset.page); renderTab(); };
+            });
+            // Expand / collapse long cell text on click
+            document.querySelectorAll('.cell-clamp').forEach(td => {
+                td.onclick = () => td.classList.toggle('expanded');
             });
         }
 
