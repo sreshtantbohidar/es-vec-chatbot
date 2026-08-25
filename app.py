@@ -409,14 +409,19 @@ _STOPWORD_TERMS = {
 
 # Relative date ranges: "current/this month", "last month", "last 6 months",
 # "past 30 days", "this year", "last year". Resolved against today's date.
+# NOTE: the generic "last/past N <unit>" patterns below must come AFTER the
+# fixed phrases (e.g. "last month") so they don't shadow them.
 _RELATIVE_RANGE_RES = (
     (re.compile(r"\b(?:current|this)\s+month\b"), "cur_month"),
     (re.compile(r"\blast\s+month\b|\bprevious\s+month\b"), "prev_month"),
-    (re.compile(r"\b(?:last|past|previous|previous\s+\d+|prior)\s+(\d+)\s*months?\b"
-                r"|\b(?:last|past)\s+(\d+)\s*months?\b"), "n_months"),
-    (re.compile(r"\b(?:last|past)\s+(\d+)\s*days?\b"), "n_days"),
     (re.compile(r"\b(?:current|this)\s+year\b"), "cur_year"),
     (re.compile(r"\blast\s+year\b|\bprevious\s+year\b"), "prev_year"),
+    # Generic: last/past N months | years | days | weeks | hours
+    (re.compile(r"\b(?:last|past|previous|prior)\s+(\d+)\s*months?\b"), "n_months"),
+    (re.compile(r"\b(?:last|past|previous|prior)\s+(\d+)\s*years?\b"), "n_years"),
+    (re.compile(r"\b(?:last|past|previous|prior)\s+(\d+)\s*days?\b"), "n_days"),
+    (re.compile(r"\b(?:last|past|previous|prior)\s+(\d+)\s*weeks?\b"), "n_weeks"),
+    (re.compile(r"\b(?:last|past|previous|prior)\s+(\d+)\s*hours?\b"), "n_hours"),
 )
 
 
@@ -443,7 +448,7 @@ def _resolve_relative_range(message):
             gte, lte = month_bounds(first.year, first.month)
             return {"gte": gte, "lte": lte}
         if kind == "n_months":
-            n = int(m.group(1) or m.group(2) or 6)
+            n = int(m.group(1))
             # Rolling window ending today: [today - n months + 1 day, today]
             anchor = today.replace(day=1)
             y, mo = anchor.year, anchor.month
@@ -452,9 +457,19 @@ def _resolve_relative_range(message):
                 if mo == 0:
                     mo, y = 12, y - 1
             return {"gte": date(y, mo, anchor.day).isoformat(), "lte": today.isoformat()}
+        if kind == "n_years":
+            n = int(m.group(1))
+            return {"gte": f"{today.year - n}-01-01", "lte": today.isoformat()}
         if kind == "n_days":
             n = int(m.group(1))
             return {"gte": (today - timedelta(days=n)).isoformat(), "lte": today.isoformat()}
+        if kind == "n_weeks":
+            n = int(m.group(1))
+            return {"gte": (today - timedelta(weeks=n)).isoformat(), "lte": today.isoformat()}
+        if kind == "n_hours":
+            n = int(m.group(1))
+            start_dt = datetime.now() - timedelta(hours=n)
+            return {"gte": start_dt.strftime("%Y-%m-%d %H:%M:%S"), "lte": today.isoformat()}
         if kind == "cur_year":
             return {"gte": f"{today.year}-01-01", "lte": f"{today.year}-12-31"}
         if kind == "prev_year":
@@ -784,6 +799,18 @@ INSTRUCTIONS:
   in time), and call out the most significant or recent items. End with a short "Key
   Observations" section of 2-4 analytical takeaways drawn from the data. Never answer with a
   bare list of one field's values when richer context is present in the documents.
+- PREDICTIONS: When asked to predict future outcomes, trends, or possibilities, you may reason
+  beyond the documents, but ONLY under these rules:
+  1. First present what the data shows (patterns, frequencies, date clustering, recurring
+     units/equipment/locations) — every factual claim must trace to a cited document.
+  2. Label every forward-looking statement explicitly as "Prediction:" or "Possible outcome:"
+     and justify it from an observed pattern (e.g. "activity at X recurred monthly in the data,
+     so continued activity is plausible").
+  3. State confidence qualitatively (low/moderate/high) based on how strong and recent the
+     pattern is; a pattern seen once justifies low confidence only.
+  4. If the retrieved records are too few or show no meaningful pattern to base a prediction on,
+     say so honestly instead of speculating.
+  5. Never present predictions as established facts.
 - If asked about a field that doesn't exist in the retrieved records, explain what fields ARE available.
 
 [Chat History]:
