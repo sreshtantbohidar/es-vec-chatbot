@@ -778,6 +778,12 @@ INSTRUCTIONS:
 - When referencing a document to the user, cite it as its stable id shown in parentheses, e.g. "document (id: abc123)".
 - When listing data, use the actual values from the documents.
 - Format your response clearly with bullet points or tables when presenting multiple records.
+- ANALYZE, don't just dump. When presenting retrieved records, synthesize them into a meaningful
+  summary: group related records (by location, date, unit, equipment type), state counts and
+  date ranges, highlight patterns (recurring locations, repeated activity types, concentration
+  in time), and call out the most significant or recent items. End with a short "Key
+  Observations" section of 2-4 analytical takeaways drawn from the data. Never answer with a
+  bare list of one field's values when richer context is present in the documents.
 - If asked about a field that doesn't exist in the retrieved records, explain what fields ARE available.
 
 [Chat History]:
