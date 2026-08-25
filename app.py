@@ -940,6 +940,11 @@ INSTRUCTIONS:
      say so honestly instead of speculating.
   5. Never present predictions as established facts.
 - If asked about a field that doesn't exist in the retrieved records, explain what fields ARE available.
+- A record can match a requested location through ANY of its location fields — location_name,
+  base_location_name, start/end_location_name, general_area, or mil_dist_loc_name (military
+  district). Before claiming a location is "not mentioned", check ALL fields of every provided
+  document. A record with location_name "shijiazhuang" but mil_dist_loc_name "Ranchi" IS a
+  Ranchi record — present it as such, noting which field matched.
 
 [Chat History]:
 {recent_history_text}
