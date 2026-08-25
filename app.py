@@ -758,6 +758,10 @@ def chat():
     system_prompt = f"""You are an intelligent, helpful RAG chatbot for a military intelligence database.
 
 DATABASE INFO:
+- Today's date: {datetime.now().strftime('%A, %Y-%m-%d')}. Use this to interpret relative time
+  references ("current month", "last month", "recent"). Documents dated within the current
+  calendar month ({datetime.now().strftime('%B %Y')}) ARE current month records — do not claim
+  none of the documents contain current month data when their activity dates fall in this month.
 - Total records in database: {total_docs}
 - Documents provided with this prompt: {num_results}
 - Available fields: {', '.join(AVAILABLE_FIELDS[:15])}, and others
