@@ -477,6 +477,29 @@ def _resolve_relative_range(message):
     return None
 
 
+def _known_locations():
+    """Distinct location values in the index (cached 5 min) for entity matching."""
+    global _KNOWN_LOCATIONS_CACHE
+    now = time.time()
+    if _KNOWN_LOCATIONS_CACHE and now - _KNOWN_LOCATIONS_CACHE[0] < 300:
+        return _KNOWN_LOCATIONS_CACHE[1]
+    try:
+        res = es.search(index=ES_INDEX, body={
+            "size": 0,
+            "aggs": {"vals": {"terms": {"field": "location_name.keyword", "size": 5000}}},
+        })
+        vals = [b["key"] for b in res["aggregations"]["vals"]["buckets"]
+                if b["key"].lower() not in _JUNK_LOCATIONS]
+    except Exception as e:
+        print(f"Known locations exception: {e}")
+        vals = []
+    _KNOWN_LOCATIONS_CACHE = (now, vals)
+    return vals
+
+
+_KNOWN_LOCATIONS_CACHE = ()
+
+
 def _extract_entities(message):
     """Pull locations, exact dates, and month/year ranges from the message."""
     lowered = message.lower()
@@ -502,6 +525,23 @@ def _extract_entities(message):
         loc = m.group(1).strip()
         if loc and loc not in _JUNK_LOCATIONS and loc not in locations:
             locations.append(loc)
+
+    # Fallback: "what latest from Ranchi", "records about Pasighat" — no
+    # "location" keyword present. Try every non-stopword word/phrase in the
+    # message against the index's location values; keep real matches only.
+    if not locations:
+        candidates = [w for w in re.findall(r"[a-z][a-z]{2,}(?:\s+[a-z][a-z]{2,})?", lowered)
+                      if w not in _STOPWORD_TERMS and w not in _JUNK_LOCATIONS]
+        if candidates:
+            known = _known_locations()
+            for cand in candidates:
+                cand_l = cand.lower()
+                if any(cand_l == k.lower() or cand_l in k.lower() or k.lower() in cand_l
+                       for k in known):
+                    if cand not in locations:
+                        locations.append(cand)
+                if len(locations) >= 3:
+                    break
     return locations, dates, month_year, year_only
 
 
