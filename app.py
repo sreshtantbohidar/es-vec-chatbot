@@ -530,14 +530,24 @@ def _extract_entities(message):
     # "location" keyword present. Try every non-stopword word/phrase in the
     # message against the index's location values; keep real matches only.
     if not locations:
-        candidates = [w for w in re.findall(r"[a-z][a-z]{2,}(?:\s+[a-z][a-z]{2,})?", lowered)
-                      if w not in _STOPWORD_TERMS and w not in _JUNK_LOCATIONS]
+        words = [w for w in re.findall(r"[a-z][a-z]{2,}", lowered)
+                 if w not in _STOPWORD_TERMS and w not in _JUNK_LOCATIONS]
+        # two-word phrases too ("new karachi"), but skip phrase if either
+        # word is a stopword (avoids "with karachi")
+        phrases = []
+        for a, b in zip(words, words[1:]):
+            phrases.append(f"{a} {b}")
+        candidates = words + phrases
         if candidates:
             known = _known_locations()
+            known_l = [k.lower() for k in known]
             for cand in candidates:
                 cand_l = cand.lower()
-                if any(cand_l == k.lower() or cand_l in k.lower() or k.lower() in cand_l
-                       for k in known):
+                # whole candidate must appear in a known value or vice versa,
+                # matching on word boundaries (not raw substring, which lets
+                # "with karachi" match via its tail)
+                if any(f" {cand_l} " in f" {k} " or f" {k} " in f" {cand_l} "
+                       for k in known_l):
                     if cand not in locations:
                         locations.append(cand)
                 if len(locations) >= 3:
@@ -573,11 +583,19 @@ def _resolve_locations(locations):
         close = difflib.get_close_matches(loc, list(lowered_known.keys()), n=1, cutoff=0.75)
         if close:                                     # typo / spelling variant
             resolved.append(lowered_known[close[0]])
-        else:                                         # substring match
-            partial = [k for k in known if loc in k.lower()]
-            if partial:
-                resolved.append(partial[0])
-    return resolved
+        else:                                         # substring match: keep ALL
+            partial = [k for k in known if loc in k.lower() or k.lower() in loc]
+            # exact match (if any) first, then variants like "new karachi"
+            partial.sort(key=lambda k: (k.lower() != loc, k))
+            resolved.extend(partial[:10])               # cap variants per location
+    # dedupe, preserving order
+    seen = set()
+    out = []
+    for r in resolved:
+        if r.lower() not in seen:
+            seen.add(r.lower())
+            out.append(r)
+    return out
 
 
 def _search_by_date_range(month_year=None, year_only=None, max_docs=30):
@@ -606,9 +624,14 @@ def _search_by_date_range(month_year=None, year_only=None, max_docs=30):
         return None
 
 
-def _search_by_entity(locations, dates, max_docs=30, debug=None):
+def _search_by_entity(locations, dates, max_docs=100, debug=None):
     """Exact-match retrieval: docs whose location field equals a named place
-    (optionally filtered by activity date). Returns hits or None."""
+    (optionally filtered by activity date). Returns hits or None.
+
+    Also matches substring variants ("karachi" -> "new karachi") via a
+    match query on the keyword fields, and ranks docs by content richness so
+    records with descriptions/comments surface ahead of bare stubs.
+    """
     if not locations:
         return None
     should = []
@@ -618,7 +641,14 @@ def _search_by_entity(locations, dates, max_docs=30, debug=None):
             for field in _LOCATION_FILTER_FIELDS:
                 should.append({"term": {f"{field}.keyword": variant}})
     body = {
-        "query": {"bool": {"should": should, "minimum_should_match": 1}},
+        "query": {"bool": {
+            "should": should + [
+                # substring catch: "karachi" should also hit "new karachi"
+                {"wildcard": {f"{f}.keyword": f"*{loc.lower()}*"}}
+                for loc in locations for f in _LOCATION_FILTER_FIELDS
+            ],
+            "minimum_should_match": 1,
+        }},
         "size": max_docs,
         "sort": ["_doc"],
     }
@@ -629,7 +659,26 @@ def _search_by_entity(locations, dates, max_docs=30, debug=None):
         debug.append({"name": "Entity exact-match (location/date)", "query": body})
     try:
         res = es.search(index=ES_INDEX, body=body)
-        return res.get("hits", {}).get("hits", [])
+        hits = res.get("hits", {}).get("hits", [])
+        # Richness ranking: docs with description/comments/equipment carry the
+        # analytical value; bare location+coords stubs are least useful.
+        def richness(hit):
+            s = hit["_source"]
+            score = 0
+            if s.get("description"):
+                score += 4
+            if s.get("comments") or s.get("add_comments") or s.get("additional_comments"):
+                score += 3
+            for f in ("equipment_name", "enemy_formation_name", "orbat_title",
+                      "training_name", "infra_name", "person_name"):
+                if s.get(f):
+                    score += 1
+            # exact primary-name match outranks substring matches
+            loc_l = locations[0].lower()
+            if (s.get("location_name") or "").lower() == loc_l:
+                score += 2
+            return -score
+        return sorted(hits, key=richness)
     except Exception as e:
         print(f"Entity search exception: {e}")
         return None
