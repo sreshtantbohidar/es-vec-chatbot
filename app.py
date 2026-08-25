@@ -566,7 +566,7 @@ def _search_by_date_range(month_year=None, year_only=None, max_docs=30):
         return None
 
 
-def _search_by_entity(locations, dates, max_docs=30):
+def _search_by_entity(locations, dates, max_docs=30, debug=None):
     """Exact-match retrieval: docs whose location field equals a named place
     (optionally filtered by activity date). Returns hits or None."""
     if not locations:
@@ -585,6 +585,8 @@ def _search_by_entity(locations, dates, max_docs=30):
     if dates:
         date_clauses = [{"term": {"activity_date.keyword": d}} for d in dates]
         body["query"]["bool"]["must"] = {"bool": {"should": date_clauses, "minimum_should_match": 0}}
+    if debug is not None:
+        debug.append({"name": "Entity exact-match (location/date)", "query": body})
     try:
         res = es.search(index=ES_INDEX, body=body)
         return res.get("hits", {}).get("hits", [])
@@ -593,14 +595,22 @@ def _search_by_entity(locations, dates, max_docs=30):
         return None
 
 
-def _retrieve_context(user_message, query_vector):
+def _retrieve_context(user_message, query_vector, debug=None):
     """Return (retrieved_context_text, num_results).
 
     Aggregation-style questions get a broad match_all fetch; everything else
     goes through multi-field kNN.
+
+    When `debug` is a list, every Elasticsearch query executed (name + body)
+    and the final fetched records are appended to it for UI inspection.
     """
     try:
         hits = None
+
+        def _log(name, body):
+            if debug is not None:
+                debug.append({"name": name, "query": body})
+
         # 1) Entity retrieval: locations (fuzzy-resolved), exact dates,
         # month/year or year ranges. Beats kNN for named entities & dates.
         locations, dates, month_year, year_only = _extract_entities(user_message)
@@ -608,7 +618,7 @@ def _retrieve_context(user_message, query_vector):
         if locations:
             resolved = _resolve_locations(locations)
             if resolved:
-                entity_hits = _search_by_entity(resolved, dates)
+                entity_hits = _search_by_entity(resolved, dates, debug=debug)
                 if entity_hits:
                     hits = entity_hits
                 elif not dates:
@@ -616,15 +626,20 @@ def _retrieve_context(user_message, query_vector):
                     pass
         if hits is None and (month_year or year_only):
             range_hits = _search_by_date_range(month_year, year_only)
+            if debug is not None:
+                debug.append({"name": "Month/year date range", "query": {
+                    "note": f"month={month_year} year_only={year_only}"}})
             if range_hits:
                 hits = range_hits
         if hits is None and dates:
             # Exact date mentioned but no location: search all docs on that date
             date_clauses = [{"term": {"activity_date.keyword": d}} for d in dates]
-            res = es.search(index=ES_INDEX, body={
+            exact_body = {
                 "query": {"bool": {"should": date_clauses, "minimum_should_match": 1}},
                 "size": 30, "sort": ["_doc"],
-            })
+            }
+            _log("Exact date search", exact_body)
+            res = es.search(index=ES_INDEX, body=exact_body)
             dhits = res.get("hits", {}).get("hits", [])
             if dhits:
                 hits = dhits
@@ -632,14 +647,16 @@ def _retrieve_context(user_message, query_vector):
         if hits is None:
             rel_range = _resolve_relative_range(user_message)
             if rel_range:
+                rel_body = {
+                    "query": {"bool": {
+                        "must": [{"exists": {"field": "activity_date"}}],
+                        "filter": [{"range": {"activity_date": rel_range}}],
+                    }},
+                    "size": 30, "sort": [{"activity_date": {"order": "desc"}}],
+                }
+                _log(f"Relative date range {rel_range['gte']} → {rel_range['lte']}", rel_body)
                 try:
-                    res = es.search(index=ES_INDEX, body={
-                        "query": {"bool": {
-                            "must": [{"exists": {"field": "activity_date"}}],
-                            "filter": [{"range": {"activity_date": rel_range}}],
-                        }},
-                        "size": 30, "sort": [{"activity_date": {"order": "desc"}}],
-                    })
+                    res = es.search(index=ES_INDEX, body=rel_body)
                     rhits = res.get("hits", {}).get("hits", [])
                     if rhits:
                         hits = rhits
@@ -680,15 +697,25 @@ def _retrieve_context(user_message, query_vector):
         if not hits:
             full_listing = _build_full_listing(user_message)
             if full_listing and _wants_enumeration(user_message):
+                if debug is not None:
+                    debug.append({"name": "Full-database terms aggregation", "query": {
+                        "note": "terms aggregations over listable fields (see _LISTABLE_FIELDS)"}})
                 return full_listing, 0  # num_results=0 signals aggregated listing
             if _is_aggregation_query(user_message):
-                hits = _fetch_all_docs()
+                agg_body = {"query": {"match_all": {}}, "size": 50, "sort": ["_doc"]}
+                _log("Broad fetch (match_all)", agg_body)
+                hits = es.search(index=ES_INDEX, body=agg_body).get("hits", {}).get("hits", [])
+                hits = hits or _fetch_all_docs()
             else:
                 knn_queries = [
                     {"field": vf, "query_vector": query_vector, "k": 10, "num_candidates": 100}
                     for vf in VECTOR_FIELD_NAMES
                 ]
-                res = es.search(index=ES_INDEX, body={"knn": knn_queries, "_source": True})
+                knn_body = {"knn": knn_queries, "_source": True}
+                _log("Multi-field kNN semantic search", {
+                    "knn_fields": VECTOR_FIELD_NAMES,
+                    "k": 10, "num_candidates": 100})
+                res = es.search(index=ES_INDEX, body=knn_body)
                 hits = res.get("hits", {}).get("hits", [])
 
                 # Keyword fallback: kNN is semantic and can miss exact token
@@ -698,13 +725,15 @@ def _retrieve_context(user_message, query_vector):
                 _kw_terms = [w for w in re.findall(r"[a-z][a-z\-]{2,}", user_message.lower())
                              if w not in _STOPWORD_TERMS]
                 if _kw_terms:
+                    kw_body = {
+                        "query": {"bool": {"should": [
+                            {"match": {"combined_text": t}} for t in _kw_terms[:5]
+                        ], "minimum_should_match": 1}},
+                        "size": 10,
+                    }
+                    _log(f"Keyword fallback (combined_text: {_kw_terms[:5]})", kw_body)
                     try:
-                        kw_res = es.search(index=ES_INDEX, body={
-                            "query": {"bool": {"should": [
-                                {"match": {"combined_text": t}} for t in _kw_terms[:5]
-                            ], "minimum_should_match": 1}},
-                            "size": 10,
-                        })
+                        kw_res = es.search(index=ES_INDEX, body=kw_body)
                         khits = kw_res.get("hits", {}).get("hits", [])
                         # Only override when a keyword hit scores well AND the
                         # top kNN docs don't already contain those keywords.
@@ -728,6 +757,11 @@ def _retrieve_context(user_message, query_vector):
         if not unique_docs:
             return "No relevant context found in index.", 0
 
+        if debug is not None:
+            debug.append({"name": "Fetched records (top 10)", "query": {
+                "note": "documents fed to the LLM as context"},
+                "records": [_hit_record(h) for h in unique_docs[:10]]})
+
         doc_blocks = []
         for i, hit in enumerate(unique_docs[:10], 1):
             src = hit["_source"]
@@ -749,6 +783,33 @@ def _retrieve_context(user_message, query_vector):
         return "No relevant context found in index.", 0
 
 
+def _hit_record(hit):
+    """Flatten one ES hit into {id, score, fields{}} for UI display."""
+    src = hit.get("_source", {})
+    fields = {}
+    for k, v in src.items():
+        if k.startswith("vec_") or k == "combined_text" or v in (None, "", []):
+            continue
+        fields[k] = v
+    return {"id": hit["_id"], "score": round(hit.get("_score") or 0, 3), "fields": fields}
+
+
+# Per-turn retrieval debug info, keyed by turn id (bounded ring buffer).
+_RETRIEVAL_DEBUG = {}
+_DEBUG_MAX_TURNS = 50
+_debug_lock = threading.Lock()
+
+
+@app.route("/retrieval-debug/<turn_id>", methods=["GET"])
+def retrieval_debug(turn_id):
+    """Return the ES queries and fetched records used for a chat turn."""
+    with _debug_lock:
+        entry = _RETRIEVAL_DEBUG.get(turn_id)
+    if not entry:
+        return jsonify({"error": "unknown turn id"}), 404
+    return jsonify(entry)
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
     """Main RAG Chat Pipeline with Infinite Memory Handling."""
@@ -764,7 +825,17 @@ def chat():
     # 2-3. Vectorize and retrieve context (kNN, or broad fetch for listing questions)
     t0 = time.time()
     query_vector = get_embedding(user_message)
-    retrieved_context, num_results = _retrieve_context(user_message, query_vector)
+    retrieval_debug = []
+    retrieved_context, num_results = _retrieve_context(user_message, query_vector,
+                                                       debug=retrieval_debug)
+    turn_id = os.urandom(8).hex()
+    with _debug_lock:
+        _RETRIEVAL_DEBUG[turn_id] = {
+            "question": user_message, "turn_id": turn_id,
+            "queries": retrieval_debug}
+        # Bounded ring buffer
+        while len(_RETRIEVAL_DEBUG) > _DEBUG_MAX_TURNS:
+            _RETRIEVAL_DEBUG.pop(next(iter(_RETRIEVAL_DEBUG)))
 
     # 4. Construct Context-Aware Prompt using Local Memory Buffers
     recent_history_text = "\n".join([f"{t['role']}: {t['content']}" for t in session['history']])
@@ -835,6 +906,7 @@ Answer based on the documents above:"""
 
     return jsonify({
         "response": bot_response,
+        "turn_id": turn_id,
         "debug_summary": session['chat_summary'],
         "debug_history_len": len(session['history']),
         "elapsed_seconds": round(time.time() - t0, 1)
@@ -979,6 +1051,80 @@ HTML_TEMPLATE = r"""
         }
         .send-btn:hover { box-shadow: 0 4px 12px rgba(37, 99, 235, .35); transform: translateY(-1px); }
         .send-btn:disabled { opacity: .6; cursor: wait; transform: none; box-shadow: none; }
+
+        /* Per-message debug button */
+        .debug-btn {
+            align-self: flex-start; margin-top: 4px;
+            background: #eef2ff; color: #4338ca; border: 1px solid #c7d2fe;
+            border-radius: 999px; font-size: 11px; padding: 3px 10px; cursor: pointer;
+            transition: background .15s;
+        }
+        .debug-btn:hover { background: #e0e7ff; }
+
+        /* Modal */
+        .modal-overlay {
+            display: none; position: fixed; inset: 0; background: rgba(15,23,42,.55);
+            z-index: 1000; justify-content: center; align-items: center; padding: 24px;
+        }
+        .modal-overlay.open { display: flex; }
+        .modal {
+            background: white; border-radius: 14px; width: min(960px, 100%);
+            max-height: 88vh; display: flex; flex-direction: column;
+            box-shadow: 0 24px 60px rgba(0,0,0,.25); overflow: hidden;
+        }
+        .modal-header {
+            padding: 14px 20px; background: var(--header); color: white;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .modal-header h3 { margin: 0; font-size: 15px; font-weight: 600; }
+        .modal-close {
+            background: rgba(255,255,255,.18); color: white; border: none;
+            border-radius: 50%; width: 28px; height: 28px; cursor: pointer; font-size: 14px;
+        }
+        .modal-close:hover { background: rgba(255,255,255,.32); }
+        .tabs { display: flex; gap: 4px; padding: 10px 16px 0; border-bottom: 1px solid var(--border); }
+        .tab-btn {
+            background: none; border: none; padding: 8px 16px; cursor: pointer;
+            font-size: 13.5px; color: var(--muted); border-bottom: 2.5px solid transparent;
+            font-weight: 600;
+        }
+        .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+        .modal-body { overflow-y: auto; padding: 16px 20px; }
+
+        /* Queries panel */
+        .q-block { margin-bottom: 14px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+        .q-title {
+            background: #f8fafc; padding: 8px 12px; font-size: 12.5px; font-weight: 600;
+            color: #1e3a8a; border-bottom: 1px solid var(--border);
+        }
+        .q-json {
+            margin: 0; padding: 10px 12px; background: #0f172a; color: #a5d6ff;
+            font-family: Consolas, monospace; font-size: 12px; white-space: pre-wrap;
+            word-break: break-word; max-height: 260px; overflow-y: auto;
+        }
+
+        /* Records table */
+        .tbl-info { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+        .records-table { width: 100%; border-collapse: collapse; font-size: 12.5px; table-layout: auto; }
+        .records-table th {
+            background: #eff6ff; color: #1e3a8a; text-align: left; position: sticky; top: 0;
+            padding: 8px 10px; border: 1px solid var(--border); white-space: nowrap;
+        }
+        .records-table td {
+            border: 1px solid var(--border); padding: 7px 10px; vertical-align: top;
+            max-width: 240px; word-break: break-word;
+        }
+        .records-table tr:nth-child(even) td { background: #f9fafb; }
+        .rec-id { font-family: Consolas, monospace; font-size: 11px; color: #6d28d9; white-space: nowrap; }
+        .pagination { display: flex; gap: 6px; align-items: center; justify-content: center; margin-top: 12px; flex-wrap: wrap; }
+        .page-btn {
+            border: 1px solid var(--border); background: white; color: var(--text);
+            border-radius: 6px; padding: 5px 11px; cursor: pointer; font-size: 12.5px;
+        }
+        .page-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+        .page-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+        .page-btn:disabled { opacity: .45; cursor: default; }
+        .empty-note { color: var(--muted); font-size: 13px; text-align: center; padding: 24px 0; }
     </style>
 </head>
 <body>
@@ -994,6 +1140,20 @@ HTML_TEMPLATE = r"""
         <div class="input-area">
             <input type="text" id="userInput" placeholder="Ask about your indexed documents…" onkeypress="handleKey(event)" autocomplete="off">
             <button class="send-btn" id="sendBtn" onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="debugModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="modalTitle">Retrieval details</h3>
+                <button class="modal-close" onclick="closeModal()">✕</button>
+            </div>
+            <div class="tabs">
+                <button class="tab-btn active" id="tabQueriesBtn" onclick="showTab('queries')">Queries</button>
+                <button class="tab-btn" id="tabRecordsBtn" onclick="showTab('records')">Records</button>
+            </div>
+            <div class="modal-body" id="modalBody"></div>
         </div>
     </div>
 
@@ -1062,7 +1222,7 @@ HTML_TEMPLATE = r"""
             return { row, wrap, bubble };
         }
 
-        function appendMessage(text, sender, elapsedSeconds, asMarkdown) {
+        function appendMessage(text, sender, elapsedSeconds, asMarkdown, turnId) {
             const { wrap, bubble } = addRow(sender);
             if (sender === 'user') {
                 bubble.textContent = text;
@@ -1077,7 +1237,153 @@ HTML_TEMPLATE = r"""
             if (sender === 'bot' && elapsedSeconds) label += ' · ' + elapsedSeconds + 's';
             meta.innerText = label;
             wrap.appendChild(meta);
+            // Debug button: show ES queries + records used for this answer
+            if (turnId) {
+                const btn = document.createElement('button');
+                btn.className = 'debug-btn';
+                btn.textContent = '🔍 View queries & data';
+                btn.onclick = () => openDebugModal(turnId, text);
+                wrap.appendChild(btn);
+            }
             chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        // ---- Retrieval debug modal ----
+        let debugData = null;      // payload from /retrieval-debug/<id>
+        let debugAnswer = '';      // the chat answer for header context
+        let currentTab = 'queries';
+        let recordsPage = 1;
+        const PAGE_SIZE = 10;
+
+        async function openDebugModal(turnId, answerText) {
+            debugAnswer = answerText || '';
+            document.getElementById('modalTitle').textContent = 'Retrieval details';
+            document.getElementById('modalBody').innerHTML =
+                '<div class="empty-note">Loading…</div>';
+            document.getElementById('debugModal').classList.add('open');
+            try {
+                const res = await fetch('/retrieval-debug/' + turnId);
+                debugData = await res.json();
+            } catch(e) {
+                debugData = null;
+                document.getElementById('modalBody').innerHTML =
+                    '<div class="empty-note">⚠️ Failed to load retrieval details.</div>';
+                return;
+            }
+            recordsPage = 1;
+            renderTab();
+        }
+
+        function closeModal() {
+            document.getElementById('debugModal').classList.remove('open');
+        }
+        document.getElementById('debugModal').addEventListener('click', function(e){
+            if (e.target === this) closeModal();
+        });
+        document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+        function showTab(tab) {
+            currentTab = tab;
+            document.getElementById('tabQueriesBtn').classList.toggle('active', tab === 'queries');
+            document.getElementById('tabRecordsBtn').classList.toggle('active', tab === 'records');
+            renderTab();
+        }
+
+        function renderTab() {
+            const body = document.getElementById('modalBody');
+            if (!debugData || !debugData.queries) return;
+            if (currentTab === 'queries') {
+                body.innerHTML = debugData.queries.length
+                    ? debugData.queries.map(q =>
+                        '<div class="q-block"><div class="q-title">' + escapeHtml(q.name) +
+                        '</div><pre class="q-json">' +
+                        escapeHtml(JSON.stringify(q.query, null, 2)) + '</pre></div>'
+                      ).join('')
+                    : '<div class="empty-note">No queries recorded.</div>';
+            } else {
+                body.innerHTML = renderRecordsTable();
+                bindPager();
+            }
+        }
+
+        // Collect all records from every query entry that carries them.
+        function collectRecords() {
+            const recs = [];
+            (debugData.queries || []).forEach(q => (q.records || []).forEach(r => recs.push(r)));
+            return recs;
+        }
+
+        function fieldLabel(key) {
+            return key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        }
+
+        function fmtVal(v) {
+            if (Array.isArray(v)) return JSON.stringify(v);
+            if (v !== null && typeof v === 'object') return JSON.stringify(v);
+            return String(v);
+        }
+
+        function renderRecordsTable() {
+            const recs = collectRecords();
+            if (!recs.length) {
+                return '<div class="empty-note">No records were fetched for this question' +
+                       ' (e.g. it was answered from a full-database aggregation).</div>';
+            }
+            // Union of fields across records, ordered sensibly
+            const allFields = [];
+            recs.forEach(r => Object.keys(r.fields).forEach(k => {
+                if (!allFields.includes(k)) allFields.push(k);
+            }));
+            const priority = ['activity_date','location_name','description','equipment_name',
+                              'enemy_formation_name'];
+            allFields.sort((a,b) => {
+                const ia = priority.indexOf(a), ib = priority.indexOf(b);
+                return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+            });
+
+            const totalPages = Math.max(1, Math.ceil(recs.length / PAGE_SIZE));
+            if (recordsPage > totalPages) recordsPage = totalPages;
+            const start = (recordsPage - 1) * PAGE_SIZE;
+            const pageRecs = recs.slice(start, start + PAGE_SIZE);
+
+            let html = '<div class="tbl-info">' + recs.length + ' record(s) · showing ' +
+                (start + 1) + '–' + (start + pageRecs.length) + ' of ' + totalPages + ' page(s)</div>';
+            html += '<table class="records-table"><thead><tr><th>#</th><th>Doc ID</th>' +
+                    '<th>Score</th>' +
+                    allFields.map(f => '<th>' + escapeHtml(fieldLabel(f)) + '</th>').join('') +
+                    '</tr></thead><tbody>';
+            pageRecs.forEach((r, i) => {
+                html += '<tr><td>' + (start + i + 1) + '</td>' +
+                        '<td class="rec-id">' + escapeHtml(r.id) + '</td>' +
+                        '<td>' + r.score + '</td>' +
+                        allFields.map(f => {
+                            const v = r.fields[f];
+                            return '<td>' + (v === undefined ? '' : escapeHtml(fmtVal(v))) + '</td>';
+                        }).join('') + '</tr>';
+            });
+            html += '</tbody></table>';
+
+            html += '<div class="pagination">';
+            html += '<button class="page-btn" id="pgPrev" ' + (recordsPage<=1?'disabled':'') + '>‹ Prev</button>';
+            const winStart = Math.max(1, Math.min(recordsPage - 2, totalPages - 4));
+            const winEnd = Math.min(totalPages, winStart + 4);
+            for (let p = Math.max(1,winStart); p <= winEnd; p++) {
+                html += '<button class="page-btn pg-num ' + (p===recordsPage?'active':'') +
+                        '" data-page="' + p + '">' + p + '</button>';
+            }
+            html += '<button class="page-btn" id="pgNext" ' + (recordsPage>=totalPages?'disabled':'') + '>Next ›</button>';
+            html += '</div>';
+            return html;
+        }
+
+        function bindPager() {
+            const prev = document.getElementById('pgPrev');
+            const next = document.getElementById('pgNext');
+            if (prev) prev.onclick = () => { recordsPage--; renderTab(); };
+            if (next) next.onclick = () => { recordsPage++; renderTab(); };
+            document.querySelectorAll('.pg-num').forEach(b => {
+                b.onclick = () => { recordsPage = parseInt(b.dataset.page); renderTab(); };
+            });
         }
 
         function showTyping() {
@@ -1110,7 +1416,7 @@ HTML_TEMPLATE = r"""
                 }
                 const data = await res.json();
                 const elapsed = data.elapsed_seconds || ((Date.now() - startedAt) / 1000).toFixed(1);
-                appendMessage(data.response, 'bot', elapsed);
+                appendMessage(data.response, 'bot', elapsed, true, data.turn_id);
             } catch(e) {
                 typingRow.remove();
                 appendMessage('⚠️ Failed to get a response.', 'bot', 0, false);
